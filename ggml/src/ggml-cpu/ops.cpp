@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
+#include "fused-cpp-sdpa.h"
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
@@ -9058,6 +9059,10 @@ void ggml_compute_forward_flash_attn_ext(
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
             {
+                if (ggml_fused_cpp_sdpa_flash_attn_ext_fp32(params, dst)) {
+                    break;
+                }
+
                 // uses F32 accumulators
                 ggml_compute_forward_flash_attn_ext_f16(params, dst);
             } break;

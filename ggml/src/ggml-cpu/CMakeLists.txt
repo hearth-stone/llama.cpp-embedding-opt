@@ -101,6 +101,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/arm/quants.c
             ggml-cpu/arch/arm/repack.cpp
             )
+        set(GGML_FUSED_CPP_FP32_PACKQKV_DIR ggml-cpu/fused-cpp/fp32_packqkv)
+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            set_source_files_properties(${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.cpp PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")
+        endif()
+        list(APPEND GGML_CPU_SOURCES
+            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.cpp
+            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.h
+            )
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FUSED_CPP_SDPA GGML_FUSED_CPP_BUILTIN)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE
+            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}
+            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/csrc)
 
         if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
             message(FATAL_ERROR "MSVC is not supported for ARM, use clang")

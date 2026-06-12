@@ -619,6 +619,8 @@ For detailed information about hardware support, setup instructions, and perform
 ## Arm® KleidiAI™
 KleidiAI is a library of optimized microkernels for AI workloads, specifically designed for Arm CPUs. These microkernels enhance performance and can be enabled for use by the CPU backend.
 
+For pinned `v1.24.0` setup instructions, including local source and offline archive builds, see [KLEIDIAI.md](./backend/KLEIDIAI.md).
+
 To enable KleidiAI, go to the llama.cpp directory and build using CMake
 ```bash
 cmake -B build -DGGML_CPU_KLEIDIAI=ON

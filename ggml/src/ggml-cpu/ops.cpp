@@ -8,9 +8,26 @@
 #include "unary-ops.h"
 #include "vec.h"
 
+#if defined(GGML_USE_FUSED_CPP_SDPA)
+#include "fused-cpp/fp32_packqkv/fp32_packqkv_sdpa.h"
+#endif
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+static bool ggml_fused_cpp_sdpa_env_is(const char * value) {
+    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
+    return env != nullptr && strcmp(env, value) == 0;
+}
+
+static bool ggml_fused_cpp_sdpa_debug() {
+    return ggml_fused_cpp_sdpa_env_is("debug") ||
+           ggml_fused_cpp_sdpa_env_is("trace");
+}
 
 // ggml_compute_forward_dup
 
@@ -9066,6 +9083,142 @@ void ggml_compute_forward_flash_attn_ext(
                 GGML_ABORT("fatal error");
             }
     }
+}
+
+void ggml_compute_forward_fused_cpp_sdpa_ext(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+#if defined(GGML_USE_FUSED_CPP_SDPA)
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_ASSERT(dst->op == GGML_OP_FUSED_CPP_SDPA_EXT);
+
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(q->ne[2] == k->ne[2]);
+    GGML_ASSERT(q->ne[2] == v->ne[2]);
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    GGML_ASSERT(dst->ne[0] == v->ne[0]);
+    GGML_ASSERT(dst->ne[1] == q->ne[2]);
+    GGML_ASSERT(dst->ne[2] == q->ne[1]);
+    GGML_ASSERT(dst->ne[3] == q->ne[3]);
+    GGML_ASSERT(q->nb[0] == ggml_type_size(q->type));
+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(scale));
+
+    const int64_t B  = q->ne[3];
+    const int64_t H  = q->ne[2];
+    const int64_t L  = q->ne[1];
+    const int64_t S  = k->ne[1];
+    const int64_t D  = q->ne[0];
+    const int64_t DV = v->ne[0];
+
+    GGML_ASSERT((DV % 8) == 0);
+
+    if (ggml_fused_cpp_sdpa_debug()) {
+        fprintf(stderr, "%s: executing fused_cpp SDPA: B=%lld H=%lld L=%lld S=%lld D=%lld DV=%lld mask=%s\n",
+                __func__,
+                (long long) B,
+                (long long) H,
+                (long long) L,
+                (long long) S,
+                (long long) D,
+                (long long) DV,
+                mask == nullptr ? "none" : ggml_type_name(mask->type));
+        fprintf(stderr, "%s: q ne=[%lld,%lld,%lld,%lld] nb_bytes=[%lld,%lld,%lld,%lld] stride_f32=[%lld,%lld,%lld,%lld]\n",
+                __func__,
+                (long long) q->ne[0],  (long long) q->ne[1],  (long long) q->ne[2],  (long long) q->ne[3],
+                (long long) q->nb[0],  (long long) q->nb[1],  (long long) q->nb[2],  (long long) q->nb[3],
+                (long long) q->nb[0] / (long long) sizeof(float),
+                (long long) q->nb[1] / (long long) sizeof(float),
+                (long long) q->nb[2] / (long long) sizeof(float),
+                (long long) q->nb[3] / (long long) sizeof(float));
+        fprintf(stderr, "%s: k ne=[%lld,%lld,%lld,%lld] nb_bytes=[%lld,%lld,%lld,%lld] stride_f32=[%lld,%lld,%lld,%lld]\n",
+                __func__,
+                (long long) k->ne[0],  (long long) k->ne[1],  (long long) k->ne[2],  (long long) k->ne[3],
+                (long long) k->nb[0],  (long long) k->nb[1],  (long long) k->nb[2],  (long long) k->nb[3],
+                (long long) k->nb[0] / (long long) sizeof(float),
+                (long long) k->nb[1] / (long long) sizeof(float),
+                (long long) k->nb[2] / (long long) sizeof(float),
+                (long long) k->nb[3] / (long long) sizeof(float));
+        fprintf(stderr, "%s: v ne=[%lld,%lld,%lld,%lld] nb_bytes=[%lld,%lld,%lld,%lld] stride_f32=[%lld,%lld,%lld,%lld]\n",
+                __func__,
+                (long long) v->ne[0],  (long long) v->ne[1],  (long long) v->ne[2],  (long long) v->ne[3],
+                (long long) v->nb[0],  (long long) v->nb[1],  (long long) v->nb[2],  (long long) v->nb[3],
+                (long long) v->nb[0] / (long long) sizeof(float),
+                (long long) v->nb[1] / (long long) sizeof(float),
+                (long long) v->nb[2] / (long long) sizeof(float),
+                (long long) v->nb[3] / (long long) sizeof(float));
+    }
+
+    int ret = 0;
+    if (mask == nullptr) {
+        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
+                (const float *) q->data,
+                (const float *) k->data,
+                (const float *) v->data,
+                (float *) dst->data,
+                B, H, L, S, D, DV,
+                (int64_t) q->nb[0], (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
+                (int64_t) k->nb[0], (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
+                (int64_t) v->nb[0], (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
+                (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
+                scale);
+    } else if (mask->type == GGML_TYPE_F16) {
+        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
+                (const float *) q->data,
+                (const float *) k->data,
+                (const float *) v->data,
+                (const uint16_t *) mask->data,
+                (float *) dst->data,
+                B, H, L, S, D, DV,
+                (int64_t) q->nb[0], (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
+                (int64_t) k->nb[0], (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
+                (int64_t) v->nb[0], (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
+                (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
+                mask->ne[0], mask->ne[1], mask->ne[2], mask->ne[3],
+                (int64_t) mask->nb[0], (int64_t) mask->nb[1], (int64_t) mask->nb[2], (int64_t) mask->nb[3],
+                scale);
+    } else {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32);
+        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
+                (const float *) q->data,
+                (const float *) k->data,
+                (const float *) v->data,
+                (const float *) mask->data,
+                (float *) dst->data,
+                B, H, L, S, D, DV,
+                (int64_t) q->nb[0], (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
+                (int64_t) k->nb[0], (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
+                (int64_t) v->nb[0], (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
+                (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
+                mask->ne[0], mask->ne[1], mask->ne[2], mask->ne[3],
+                (int64_t) mask->nb[0], (int64_t) mask->nb[1], (int64_t) mask->nb[2], (int64_t) mask->nb[3],
+                scale);
+    }
+
+    if (ret != 0) {
+        GGML_ABORT("fused_cpp fp32_packqkv sdpa failed with code %d", ret);
+    }
+#else
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    GGML_ABORT("fused_cpp fp32_packqkv sdpa is not enabled in this build");
+#endif
 }
 
 // ggml_compute_forward_flash_attn_back

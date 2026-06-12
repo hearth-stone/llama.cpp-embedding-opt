@@ -556,6 +556,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FUSED_CPP_SDPA_EXT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2415,6 +2416,16 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // fused_cpp embedding SDPA path:
+    // q/k/v/out are F32, MHA only (n_head == n_head_kv), mask is optional F16.
+    GGML_API struct ggml_tensor * ggml_fused_cpp_sdpa_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

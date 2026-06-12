@@ -463,6 +463,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
         case GGML_OP_IM2COL_BACK:
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
+        case GGML_OP_FUSED_CPP_SDPA_EXT:
+#if defined(GGML_USE_FUSED_CPP_SDPA)
+            return op->type == GGML_TYPE_F32 &&
+                src0->type == GGML_TYPE_F32 &&
+                src1->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F16 || op->src[3]->type == GGML_TYPE_F32);
+#else
+            return false;
+#endif
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
         case GGML_OP_OUT_PROD:

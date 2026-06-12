@@ -14,6 +14,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -60,6 +61,28 @@ static bool can_reuse_kq_mask(
 }
 
 // impl
+
+static bool llm_fused_cpp_sdpa_env_is(const char * value) {
+    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
+    return env != nullptr && strcmp(env, value) == 0;
+}
+
+static bool llm_fused_cpp_sdpa_enabled() {
+    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
+    if (env == nullptr || env[0] == '\0') {
+        return true;
+    }
+
+    return !llm_fused_cpp_sdpa_env_is("0")     &&
+           !llm_fused_cpp_sdpa_env_is("off")   &&
+           !llm_fused_cpp_sdpa_env_is("false") &&
+           !llm_fused_cpp_sdpa_env_is("no");
+}
+
+static bool llm_fused_cpp_sdpa_debug() {
+    return llm_fused_cpp_sdpa_env_is("debug") ||
+           llm_fused_cpp_sdpa_env_is("trace");
+}
 
 static ggml_tensor * ggml_mul_mat_aux(
         ggml_context * ctx,
@@ -2046,7 +2069,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+                bool   no_cache_attn) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2068,23 +2092,84 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
-        if (k->type == GGML_TYPE_F32) {
-            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
-        }
+        const bool mask_supported = kq_mask == nullptr ||
+            ((kq_mask->type == GGML_TYPE_F16 || kq_mask->type == GGML_TYPE_F32) &&
+             ggml_is_contiguous(kq_mask) &&
+             kq_mask->ne[0] >= k->ne[1] &&
+             kq_mask->ne[1] >= q->ne[1] &&
+             kq_mask->ne[2] > 0 &&
+             kq_mask->ne[3] > 0 &&
+             q->ne[2] % kq_mask->ne[2] == 0 &&
+             q->ne[3] % kq_mask->ne[3] == 0);
 
-        if (v->type == GGML_TYPE_F32) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
-        }
+        const bool use_fused_cpp_attn =
+#if defined(__aarch64__) || defined(_M_ARM64)
+            llm_fused_cpp_sdpa_enabled() &&
+            no_cache_attn &&
+            backend_cpu != nullptr &&
+            sinks == nullptr &&
+            v_mla == nullptr &&
+            hparams.f_max_alibi_bias == 0.0f &&
+            !hparams.attn_soft_cap &&
+            n_head == n_head_kv &&
+            q->type == GGML_TYPE_F32 &&
+            k->type == GGML_TYPE_F32 &&
+            v->type == GGML_TYPE_F32 &&
+            q->ne[1] == k->ne[1] &&
+            k->ne[1] == v->ne[1] &&
+            q->ne[2] == k->ne[2] &&
+            q->ne[2] == v->ne[2] &&
+            q->ne[3] == k->ne[3] &&
+            q->ne[3] == v->ne[3] &&
+            q->nb[0] == ggml_type_size(q->type) &&
+            (v->ne[0] % 8) == 0 &&
+            mask_supported;
+#else
+            false;
+#endif
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+        if (use_fused_cpp_attn) {
+            if (llm_fused_cpp_sdpa_debug()) {
+                LLAMA_LOG_INFO("%s: using fused_cpp SDPA layer %d: B=%lld H=%lld L=%lld S=%lld D=%lld DV=%lld mask=%s\n",
+                        __func__, il,
+                        (long long) q->ne[3],
+                        (long long) q->ne[2],
+                        (long long) q->ne[1],
+                        (long long) k->ne[1],
+                        (long long) q->ne[0],
+                        (long long) v->ne[0],
+                        kq_mask == nullptr ? "none" : ggml_type_name(kq_mask->type));
+            }
 
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+            cur = ggml_fused_cpp_sdpa_ext(ctx0, q, k, v, kq_mask, kq_scale);
+            cb(cur, "fused_cpp_attn", il);
+            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
 
-        if (v_mla) {
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        } else {
+            ggml_tensor * kq_mask_flash = kq_mask;
+            if (kq_mask_flash != nullptr && kq_mask_flash->type == GGML_TYPE_F32) {
+                kq_mask_flash = ggml_cast(ctx0, kq_mask_flash, GGML_TYPE_F16);
+                cb(kq_mask_flash, "kq_mask_f16", il);
+            }
+
+            // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
+            if (k->type == GGML_TYPE_F32) {
+                k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            }
+
+            if (v->type == GGML_TYPE_F32) {
+                v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            }
+
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask_flash, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+            if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
             // However, the code is optimized for dimensions 0 and 1 being large, so this is inefficient.
@@ -2099,9 +2184,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
 #endif
-        }
+            }
 
-        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        }
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
@@ -2175,8 +2261,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
-    // flash attention requires an f16 mask
-    const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // The fused_cpp embedding path consumes the additive mask directly as F32.
+    // Flash-attn fallback casts this input to F16 at the call site.
+    const auto type_mask =
+#if defined(__aarch64__) || defined(_M_ARM64)
+        cparams.flash_attn && llm_fused_cpp_sdpa_enabled() ? GGML_TYPE_F32 :
+#endif
+        cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
     inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
@@ -2231,7 +2322,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, true);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2330,7 +2421,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, false);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -2421,7 +2512,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, false);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2506,7 +2597,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il, false);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2585,7 +2676,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, false);
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -2648,7 +2739,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, false);
     cb(cur, "kqv_out", il);
 
     if (wo) {

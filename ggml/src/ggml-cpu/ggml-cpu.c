@@ -2985,6 +2985,7 @@ struct ggml_cplan ggml_graph_plan(
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_op_profile     = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3062,11 +3063,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const bool profile_node = ggml_cpu_op_profile && state->ith == 0 && params.nth == 1;
+        const int64_t t_start_us = profile_node ? ggml_time_us() : 0;
+
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (profile_node) {
+            const int64_t t_end_us = ggml_time_us();
+            const struct ggml_tensor * src0 = node->src[0];
+            const struct ggml_tensor * src1 = node->src[1];
+            fprintf(stderr,
+                    "[ggml_cpu_op_profile]\t%d\t%s\t%s\t%s\t%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "\t%" PRId64 "\t%d\t%s\t%s\n",
+                    node_n,
+                    ggml_op_name(node->op),
+                    node->name,
+                    ggml_type_name(node->type),
+                    node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                    t_end_us - t_start_us,
+                    n_fused,
+                    src0 != NULL ? src0->name : "-",
+                    src1 != NULL ? src1->name : "-");
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3836,6 +3857,10 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+        {
+            const char * env = getenv("GGML_CPU_OP_PROFILE");
+            ggml_cpu_op_profile = (env != NULL && atoi(env) == 1);
         }
 
         is_first_call = false;

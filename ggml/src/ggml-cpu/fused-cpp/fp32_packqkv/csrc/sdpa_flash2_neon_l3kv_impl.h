@@ -754,7 +754,17 @@ inline void add_mask_f16_to_scores_block_impl(
     const char* mask_row =
         mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
     float* row = scores + i * scores_row_stride;
-    for (int j = 0; j < s_count; ++j) {
+    int j = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+    if (p.mask_f16_nb0 == static_cast<int64_t>(sizeof(uint16_t))) {
+      const uint16_t* m = reinterpret_cast<const uint16_t*>(mask_row);
+      for (; j + 4 <= s_count; j += 4) {
+        const float32x4_t mf = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(m + j)));
+        vst1q_f32(row + j, vaddq_f32(vld1q_f32(row + j), mf));
+      }
+    }
+#endif
+    for (; j < s_count; ++j) {
       row[j] += load_mask_f16_from_ptr_impl(mask_row + j * p.mask_f16_nb0);
     }
   }
@@ -774,7 +784,16 @@ inline void add_mask_f32_to_scores_block_impl(
     const char* mask_row =
         mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
     float* row = scores + i * scores_row_stride;
-    for (int j = 0; j < s_count; ++j) {
+    int j = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+    if (p.mask_f32_nb0 == static_cast<int64_t>(sizeof(float))) {
+      const float* m = reinterpret_cast<const float*>(mask_row);
+      for (; j + 4 <= s_count; j += 4) {
+        vst1q_f32(row + j, vaddq_f32(vld1q_f32(row + j), vld1q_f32(m + j)));
+      }
+    }
+#endif
+    for (; j < s_count; ++j) {
       row[j] += load_mask_f32_from_ptr_impl(mask_row + j * p.mask_f32_nb0);
     }
   }

@@ -12,6 +12,10 @@
 #include "neon_cache_config.h"
 #include "../sdpa_pack_utils.h"
 
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+#include <arm_sve.h>
+#endif
+
 namespace fused_cpp::sdpa_microkernels {
 
 using ::fused_cpp::sdpa_pack_utils::copy_u16x4;
@@ -2882,6 +2886,206 @@ static inline void gemm_pv_microkernel_8x8_fp32_pquad(
   vst1q_f32(O + 7 * o_row_stride + 0, o70);
   vst1q_f32(O + 7 * o_row_stride + 4, o71);
 }
+
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+static inline bool gemm_pv_microkernel_8x8_fp32_pquad_sve(
+    const float* P_hat,
+    int64_t P_row_stride,
+    const float* V,
+    int64_t v_row_stride,
+    int64_t Sk,
+    float* O,
+    int64_t o_row_stride) {
+  if (svcntw() < 8) {
+    return false;
+  }
+
+  const svbool_t pg = svptrue_pat_b32(SV_VL8);
+  svfloat32_t o0 = svld1_f32(pg, O + 0 * o_row_stride);
+  svfloat32_t o1 = svld1_f32(pg, O + 1 * o_row_stride);
+  svfloat32_t o2 = svld1_f32(pg, O + 2 * o_row_stride);
+  svfloat32_t o3 = svld1_f32(pg, O + 3 * o_row_stride);
+  svfloat32_t o4 = svld1_f32(pg, O + 4 * o_row_stride);
+  svfloat32_t o5 = svld1_f32(pg, O + 5 * o_row_stride);
+  svfloat32_t o6 = svld1_f32(pg, O + 6 * o_row_stride);
+  svfloat32_t o7 = svld1_f32(pg, O + 7 * o_row_stride);
+
+  int64_t k = 0;
+  for (; k + 4 <= Sk; k += 4) {
+    const svfloat32_t v0 = svld1_f32(pg, V + (k + 0) * v_row_stride);
+    const svfloat32_t v1 = svld1_f32(pg, V + (k + 1) * v_row_stride);
+    const svfloat32_t v2 = svld1_f32(pg, V + (k + 2) * v_row_stride);
+    const svfloat32_t v3 = svld1_f32(pg, V + (k + 3) * v_row_stride);
+    const svfloat32_t p0 = svld1rq_f32(pg, P_hat + 0 * P_row_stride + k);
+    const svfloat32_t p1 = svld1rq_f32(pg, P_hat + 1 * P_row_stride + k);
+    const svfloat32_t p2 = svld1rq_f32(pg, P_hat + 2 * P_row_stride + k);
+    const svfloat32_t p3 = svld1rq_f32(pg, P_hat + 3 * P_row_stride + k);
+    const svfloat32_t p4 = svld1rq_f32(pg, P_hat + 4 * P_row_stride + k);
+    const svfloat32_t p5 = svld1rq_f32(pg, P_hat + 5 * P_row_stride + k);
+    const svfloat32_t p6 = svld1rq_f32(pg, P_hat + 6 * P_row_stride + k);
+    const svfloat32_t p7 = svld1rq_f32(pg, P_hat + 7 * P_row_stride + k);
+
+#define FUSED_CPP_PV_SVE_ROW(ID, P)                               \
+    do {                                                          \
+      o##ID = svmla_lane_f32(o##ID, v0, P, 0);                    \
+      o##ID = svmla_lane_f32(o##ID, v1, P, 1);                    \
+      o##ID = svmla_lane_f32(o##ID, v2, P, 2);                    \
+      o##ID = svmla_lane_f32(o##ID, v3, P, 3);                    \
+    } while (0)
+
+    FUSED_CPP_PV_SVE_ROW(0, p0);
+    FUSED_CPP_PV_SVE_ROW(1, p1);
+    FUSED_CPP_PV_SVE_ROW(2, p2);
+    FUSED_CPP_PV_SVE_ROW(3, p3);
+    FUSED_CPP_PV_SVE_ROW(4, p4);
+    FUSED_CPP_PV_SVE_ROW(5, p5);
+    FUSED_CPP_PV_SVE_ROW(6, p6);
+    FUSED_CPP_PV_SVE_ROW(7, p7);
+#undef FUSED_CPP_PV_SVE_ROW
+  }
+
+  for (; k < Sk; ++k) {
+    const svfloat32_t v = svld1_f32(pg, V + k * v_row_stride);
+#define FUSED_CPP_PV_SVE_TAIL(ID)                                      \
+    o##ID = svmla_n_f32_x(pg, o##ID, v, P_hat[(ID) * P_row_stride + k])
+    FUSED_CPP_PV_SVE_TAIL(0);
+    FUSED_CPP_PV_SVE_TAIL(1);
+    FUSED_CPP_PV_SVE_TAIL(2);
+    FUSED_CPP_PV_SVE_TAIL(3);
+    FUSED_CPP_PV_SVE_TAIL(4);
+    FUSED_CPP_PV_SVE_TAIL(5);
+    FUSED_CPP_PV_SVE_TAIL(6);
+    FUSED_CPP_PV_SVE_TAIL(7);
+#undef FUSED_CPP_PV_SVE_TAIL
+  }
+
+  svst1_f32(pg, O + 0 * o_row_stride, o0);
+  svst1_f32(pg, O + 1 * o_row_stride, o1);
+  svst1_f32(pg, O + 2 * o_row_stride, o2);
+  svst1_f32(pg, O + 3 * o_row_stride, o3);
+  svst1_f32(pg, O + 4 * o_row_stride, o4);
+  svst1_f32(pg, O + 5 * o_row_stride, o5);
+  svst1_f32(pg, O + 6 * o_row_stride, o6);
+  svst1_f32(pg, O + 7 * o_row_stride, o7);
+  return true;
+}
+
+static inline bool gemm_pv_microkernel_8x16_fp32_pquad_sve(
+    const float* P_hat,
+    int64_t P_row_stride,
+    const float* V_lo,
+    const float* V_hi,
+    int64_t v_row_stride,
+    int64_t Sk,
+    float* O,
+    int64_t o_row_stride) {
+  if (svcntw() < 8) {
+    return false;
+  }
+
+  const svbool_t pg = svptrue_pat_b32(SV_VL8);
+  svfloat32_t o00 = svld1_f32(pg, O + 0 * o_row_stride + 0);
+  svfloat32_t o01 = svld1_f32(pg, O + 0 * o_row_stride + 8);
+  svfloat32_t o10 = svld1_f32(pg, O + 1 * o_row_stride + 0);
+  svfloat32_t o11 = svld1_f32(pg, O + 1 * o_row_stride + 8);
+  svfloat32_t o20 = svld1_f32(pg, O + 2 * o_row_stride + 0);
+  svfloat32_t o21 = svld1_f32(pg, O + 2 * o_row_stride + 8);
+  svfloat32_t o30 = svld1_f32(pg, O + 3 * o_row_stride + 0);
+  svfloat32_t o31 = svld1_f32(pg, O + 3 * o_row_stride + 8);
+  svfloat32_t o40 = svld1_f32(pg, O + 4 * o_row_stride + 0);
+  svfloat32_t o41 = svld1_f32(pg, O + 4 * o_row_stride + 8);
+  svfloat32_t o50 = svld1_f32(pg, O + 5 * o_row_stride + 0);
+  svfloat32_t o51 = svld1_f32(pg, O + 5 * o_row_stride + 8);
+  svfloat32_t o60 = svld1_f32(pg, O + 6 * o_row_stride + 0);
+  svfloat32_t o61 = svld1_f32(pg, O + 6 * o_row_stride + 8);
+  svfloat32_t o70 = svld1_f32(pg, O + 7 * o_row_stride + 0);
+  svfloat32_t o71 = svld1_f32(pg, O + 7 * o_row_stride + 8);
+
+  int64_t k = 0;
+#define FUSED_CPP_PV_SVE_8X16_ROW(ID, KK)                          \
+  do {                                                            \
+    const svfloat32_t p =                                         \
+        svld1rq_f32(pg, P_hat + (ID) * P_row_stride + (KK));      \
+    o##ID##0 = svmla_lane_f32(o##ID##0, v0l, p, 0);               \
+    o##ID##1 = svmla_lane_f32(o##ID##1, v0h, p, 0);               \
+    o##ID##0 = svmla_lane_f32(o##ID##0, v1l, p, 1);               \
+    o##ID##1 = svmla_lane_f32(o##ID##1, v1h, p, 1);               \
+    o##ID##0 = svmla_lane_f32(o##ID##0, v2l, p, 2);               \
+    o##ID##1 = svmla_lane_f32(o##ID##1, v2h, p, 2);               \
+    o##ID##0 = svmla_lane_f32(o##ID##0, v3l, p, 3);               \
+    o##ID##1 = svmla_lane_f32(o##ID##1, v3h, p, 3);               \
+  } while (0)
+
+#define FUSED_CPP_PV_SVE_8X16_K4(KK)                               \
+  do {                                                            \
+    const svfloat32_t v0l = svld1_f32(pg, V_lo + ((KK) + 0) * v_row_stride); \
+    const svfloat32_t v0h = svld1_f32(pg, V_hi + ((KK) + 0) * v_row_stride); \
+    const svfloat32_t v1l = svld1_f32(pg, V_lo + ((KK) + 1) * v_row_stride); \
+    const svfloat32_t v1h = svld1_f32(pg, V_hi + ((KK) + 1) * v_row_stride); \
+    const svfloat32_t v2l = svld1_f32(pg, V_lo + ((KK) + 2) * v_row_stride); \
+    const svfloat32_t v2h = svld1_f32(pg, V_hi + ((KK) + 2) * v_row_stride); \
+    const svfloat32_t v3l = svld1_f32(pg, V_lo + ((KK) + 3) * v_row_stride); \
+    const svfloat32_t v3h = svld1_f32(pg, V_hi + ((KK) + 3) * v_row_stride); \
+    FUSED_CPP_PV_SVE_8X16_ROW(0, (KK));                           \
+    FUSED_CPP_PV_SVE_8X16_ROW(1, (KK));                           \
+    FUSED_CPP_PV_SVE_8X16_ROW(2, (KK));                           \
+    FUSED_CPP_PV_SVE_8X16_ROW(3, (KK));                           \
+    FUSED_CPP_PV_SVE_8X16_ROW(4, (KK));                           \
+    FUSED_CPP_PV_SVE_8X16_ROW(5, (KK));                           \
+    FUSED_CPP_PV_SVE_8X16_ROW(6, (KK));                           \
+    FUSED_CPP_PV_SVE_8X16_ROW(7, (KK));                           \
+  } while (0)
+
+  for (; k + 8 <= Sk; k += 8) {
+    FUSED_CPP_PV_SVE_8X16_K4(k);
+    FUSED_CPP_PV_SVE_8X16_K4(k + 4);
+  }
+  for (; k + 4 <= Sk; k += 4) {
+    FUSED_CPP_PV_SVE_8X16_K4(k);
+  }
+#undef FUSED_CPP_PV_SVE_8X16_K4
+#undef FUSED_CPP_PV_SVE_8X16_ROW
+
+  for (; k < Sk; ++k) {
+    const svfloat32_t vl = svld1_f32(pg, V_lo + k * v_row_stride);
+    const svfloat32_t vh = svld1_f32(pg, V_hi + k * v_row_stride);
+#define FUSED_CPP_PV_SVE_8X16_TAIL(ID)                             \
+    do {                                                          \
+      const float p = P_hat[(ID) * P_row_stride + k];             \
+      o##ID##0 = svmla_n_f32_x(pg, o##ID##0, vl, p);              \
+      o##ID##1 = svmla_n_f32_x(pg, o##ID##1, vh, p);              \
+    } while (0)
+
+    FUSED_CPP_PV_SVE_8X16_TAIL(0);
+    FUSED_CPP_PV_SVE_8X16_TAIL(1);
+    FUSED_CPP_PV_SVE_8X16_TAIL(2);
+    FUSED_CPP_PV_SVE_8X16_TAIL(3);
+    FUSED_CPP_PV_SVE_8X16_TAIL(4);
+    FUSED_CPP_PV_SVE_8X16_TAIL(5);
+    FUSED_CPP_PV_SVE_8X16_TAIL(6);
+    FUSED_CPP_PV_SVE_8X16_TAIL(7);
+#undef FUSED_CPP_PV_SVE_8X16_TAIL
+  }
+
+  svst1_f32(pg, O + 0 * o_row_stride + 0, o00);
+  svst1_f32(pg, O + 0 * o_row_stride + 8, o01);
+  svst1_f32(pg, O + 1 * o_row_stride + 0, o10);
+  svst1_f32(pg, O + 1 * o_row_stride + 8, o11);
+  svst1_f32(pg, O + 2 * o_row_stride + 0, o20);
+  svst1_f32(pg, O + 2 * o_row_stride + 8, o21);
+  svst1_f32(pg, O + 3 * o_row_stride + 0, o30);
+  svst1_f32(pg, O + 3 * o_row_stride + 8, o31);
+  svst1_f32(pg, O + 4 * o_row_stride + 0, o40);
+  svst1_f32(pg, O + 4 * o_row_stride + 8, o41);
+  svst1_f32(pg, O + 5 * o_row_stride + 0, o50);
+  svst1_f32(pg, O + 5 * o_row_stride + 8, o51);
+  svst1_f32(pg, O + 6 * o_row_stride + 0, o60);
+  svst1_f32(pg, O + 6 * o_row_stride + 8, o61);
+  svst1_f32(pg, O + 7 * o_row_stride + 0, o70);
+  svst1_f32(pg, O + 7 * o_row_stride + 8, o71);
+  return true;
+}
+#endif
 
 // gemm_pv_microkernel_8x8_bf16_pbf16_bfmlal：
 //   bf16 PV 快路径：把 P_hat 每 4-k 的 fp32 quad 临时 round 到 bf16，

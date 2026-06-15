@@ -1,4 +1,5 @@
 #include "fp32_packqkv_sdpa.h"
+#include "sdpa_microkernels/neon_cache_config.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,6 +9,10 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+#include <arm_sve.h>
+#endif
 
 #include "sdpa_common.h"
 #include "sdpa_tile_sizes.h"
@@ -68,6 +73,11 @@ bool env_flag_enabled(const char* name) {
          std::strcmp(env, "off") != 0 &&
          std::strcmp(env, "false") != 0 &&
          std::strcmp(env, "no") != 0;
+}
+
+bool use_sve_microkernels() {
+  static const bool enabled = env_flag_enabled("FUSED_CPP_SDPA_USE_SVE_KERNELS");
+  return enabled;
 }
 
 inline void check_config(const Config& cfg) {
@@ -318,6 +328,9 @@ inline void qkt_packk8_tail_scalar(
 struct MK_Fp32PackK8PQuad {
   static constexpr const char* kName = "fp32_packk8_pquad";
   static constexpr bool kHasKSBlock8Layout = true;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+  static constexpr bool kSupportsQktNeonRowMax = true;
+#endif
 
   static inline void qkt_8x8(
       const float* Q, int64_t q_row_stride,
@@ -439,6 +452,124 @@ struct MK_Fp32PackK8PQuad {
 #endif
   }
 
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+  static inline void qkt_8x8_rowmax(
+      const float* Q, int64_t q_row_stride,
+      const float* Kp, int64_t,
+      int64_t E, float scale,
+      float* scores_buf, int64_t scores_row_stride,
+      float32x4_t row_max_lo[8],
+      float32x4_t row_max_hi[8]) {
+    float32x4_t lo0 = vdupq_n_f32(0.0f), hi0 = vdupq_n_f32(0.0f);
+    float32x4_t lo1 = vdupq_n_f32(0.0f), hi1 = vdupq_n_f32(0.0f);
+    float32x4_t lo2 = vdupq_n_f32(0.0f), hi2 = vdupq_n_f32(0.0f);
+    float32x4_t lo3 = vdupq_n_f32(0.0f), hi3 = vdupq_n_f32(0.0f);
+    float32x4_t lo4 = vdupq_n_f32(0.0f), hi4 = vdupq_n_f32(0.0f);
+    float32x4_t lo5 = vdupq_n_f32(0.0f), hi5 = vdupq_n_f32(0.0f);
+    float32x4_t lo6 = vdupq_n_f32(0.0f), hi6 = vdupq_n_f32(0.0f);
+    float32x4_t lo7 = vdupq_n_f32(0.0f), hi7 = vdupq_n_f32(0.0f);
+
+    const float* q0 = Q + 0 * q_row_stride;
+    const float* q1 = Q + 1 * q_row_stride;
+    const float* q2 = Q + 2 * q_row_stride;
+    const float* q3 = Q + 3 * q_row_stride;
+    const float* q4 = Q + 4 * q_row_stride;
+    const float* q5 = Q + 5 * q_row_stride;
+    const float* q6 = Q + 6 * q_row_stride;
+    const float* q7 = Q + 7 * q_row_stride;
+
+    int64_t e = 0;
+    constexpr int64_t kQktPrefetchDistance = 16;
+    for (; e + 4 <= E; e += 4) {
+      const int64_t e_pf = e + kQktPrefetchDistance;
+      if (e_pf < E) {
+        const float* k_pf = Kp + e_pf * 8;
+        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf);
+        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf + 16);
+      }
+
+      const float32x4_t k0l = vld1q_f32(Kp + (e + 0) * 8 + 0);
+      const float32x4_t k0h = vld1q_f32(Kp + (e + 0) * 8 + 4);
+      const float32x4_t k1l = vld1q_f32(Kp + (e + 1) * 8 + 0);
+      const float32x4_t k1h = vld1q_f32(Kp + (e + 1) * 8 + 4);
+      const float32x4_t k2l = vld1q_f32(Kp + (e + 2) * 8 + 0);
+      const float32x4_t k2h = vld1q_f32(Kp + (e + 2) * 8 + 4);
+      const float32x4_t k3l = vld1q_f32(Kp + (e + 3) * 8 + 0);
+      const float32x4_t k3h = vld1q_f32(Kp + (e + 3) * 8 + 4);
+      const float32x4_t qv0 = vld1q_f32(q0 + e);
+      const float32x4_t qv1 = vld1q_f32(q1 + e);
+      const float32x4_t qv2 = vld1q_f32(q2 + e);
+      const float32x4_t qv3 = vld1q_f32(q3 + e);
+      const float32x4_t qv4 = vld1q_f32(q4 + e);
+      const float32x4_t qv5 = vld1q_f32(q5 + e);
+      const float32x4_t qv6 = vld1q_f32(q6 + e);
+      const float32x4_t qv7 = vld1q_f32(q7 + e);
+
+#define FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(ID, QV)               \
+      do {                                                        \
+        lo##ID = vfmaq_laneq_f32(lo##ID, k0l, QV, 0);             \
+        hi##ID = vfmaq_laneq_f32(hi##ID, k0h, QV, 0);             \
+        lo##ID = vfmaq_laneq_f32(lo##ID, k1l, QV, 1);             \
+        hi##ID = vfmaq_laneq_f32(hi##ID, k1h, QV, 1);             \
+        lo##ID = vfmaq_laneq_f32(lo##ID, k2l, QV, 2);             \
+        hi##ID = vfmaq_laneq_f32(hi##ID, k2h, QV, 2);             \
+        lo##ID = vfmaq_laneq_f32(lo##ID, k3l, QV, 3);             \
+        hi##ID = vfmaq_laneq_f32(hi##ID, k3h, QV, 3);             \
+      } while (0)
+
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(0, qv0);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(1, qv1);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(2, qv2);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(3, qv3);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(4, qv4);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(5, qv5);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(6, qv6);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW(7, qv7);
+#undef FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_ROW
+    }
+
+    for (; e < E; ++e) {
+      const float32x4_t kl = vld1q_f32(Kp + e * 8 + 0);
+      const float32x4_t kh = vld1q_f32(Kp + e * 8 + 4);
+#define FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(ID, QROW)            \
+      do {                                                        \
+        const float q = QROW[e];                                  \
+        lo##ID = vfmaq_n_f32(lo##ID, kl, q);                      \
+        hi##ID = vfmaq_n_f32(hi##ID, kh, q);                      \
+      } while (0)
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(0, q0);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(1, q1);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(2, q2);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(3, q3);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(4, q4);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(5, q5);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(6, q6);
+      FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL(7, q7);
+#undef FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL
+    }
+
+    const float32x4_t scale_v = vdupq_n_f32(scale);
+#define FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(ID)                 \
+    do {                                                          \
+      const float32x4_t slo = vmulq_f32(lo##ID, scale_v);         \
+      const float32x4_t shi = vmulq_f32(hi##ID, scale_v);         \
+      row_max_lo[ID] = vmaxq_f32(row_max_lo[ID], slo);            \
+      row_max_hi[ID] = vmaxq_f32(row_max_hi[ID], shi);            \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride + 0, slo);  \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride + 4, shi);  \
+    } while (0)
+    FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(0);
+    FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(1);
+    FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(2);
+    FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(3);
+    FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(4);
+    FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(5);
+    FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(6);
+    FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(7);
+#undef FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW
+  }
+#endif
+
   static inline void qkt_8x4(
       const float* Q, int64_t q_row_stride,
       const float* Kp, int64_t,
@@ -527,6 +658,96 @@ struct MK_Fp32PackK8PQuad {
 #endif
   }
 
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+  static inline void qkt_8x4_rowmax(
+      const float* Q, int64_t q_row_stride,
+      const float* Kp, int64_t,
+      int64_t E, float scale,
+      float* scores_buf, int64_t scores_row_stride,
+      float32x4_t row_max_lo[8]) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+    float32x4_t acc4 = vdupq_n_f32(0.0f);
+    float32x4_t acc5 = vdupq_n_f32(0.0f);
+    float32x4_t acc6 = vdupq_n_f32(0.0f);
+    float32x4_t acc7 = vdupq_n_f32(0.0f);
+
+    const float* q0 = Q + 0 * q_row_stride;
+    const float* q1 = Q + 1 * q_row_stride;
+    const float* q2 = Q + 2 * q_row_stride;
+    const float* q3 = Q + 3 * q_row_stride;
+    const float* q4 = Q + 4 * q_row_stride;
+    const float* q5 = Q + 5 * q_row_stride;
+    const float* q6 = Q + 6 * q_row_stride;
+    const float* q7 = Q + 7 * q_row_stride;
+
+    int64_t e = 0;
+    for (; e + 4 <= E; e += 4) {
+      const float32x4_t qv0 = vld1q_f32(q0 + e);
+      const float32x4_t qv1 = vld1q_f32(q1 + e);
+      const float32x4_t qv2 = vld1q_f32(q2 + e);
+      const float32x4_t qv3 = vld1q_f32(q3 + e);
+      const float32x4_t qv4 = vld1q_f32(q4 + e);
+      const float32x4_t qv5 = vld1q_f32(q5 + e);
+      const float32x4_t qv6 = vld1q_f32(q6 + e);
+      const float32x4_t qv7 = vld1q_f32(q7 + e);
+      const float32x4_t k0 = vld1q_f32(Kp + (e + 0) * 8);
+      const float32x4_t k1 = vld1q_f32(Kp + (e + 1) * 8);
+      const float32x4_t k2 = vld1q_f32(Kp + (e + 2) * 8);
+      const float32x4_t k3 = vld1q_f32(Kp + (e + 3) * 8);
+#define FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(ID, QV)               \
+      do {                                                        \
+        acc##ID = vfmaq_laneq_f32(acc##ID, k0, QV, 0);            \
+        acc##ID = vfmaq_laneq_f32(acc##ID, k1, QV, 1);            \
+        acc##ID = vfmaq_laneq_f32(acc##ID, k2, QV, 2);            \
+        acc##ID = vfmaq_laneq_f32(acc##ID, k3, QV, 3);            \
+      } while (0)
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(0, qv0);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(1, qv1);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(2, qv2);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(3, qv3);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(4, qv4);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(5, qv5);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(6, qv6);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW(7, qv7);
+#undef FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_ROW
+    }
+    for (; e < E; ++e) {
+      const float32x4_t k = vld1q_f32(Kp + e * 8);
+#define FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(ID, QROW)            \
+      do { acc##ID = vfmaq_n_f32(acc##ID, k, QROW[e]); } while (0)
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(0, q0);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(1, q1);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(2, q2);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(3, q3);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(4, q4);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(5, q5);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(6, q6);
+      FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL(7, q7);
+#undef FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL
+    }
+
+    const float32x4_t scale_v = vdupq_n_f32(scale);
+#define FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(ID)                 \
+    do {                                                          \
+      const float32x4_t s = vmulq_f32(acc##ID, scale_v);          \
+      row_max_lo[ID] = vmaxq_f32(row_max_lo[ID], s);              \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride, s);        \
+    } while (0)
+    FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(0);
+    FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(1);
+    FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(2);
+    FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(3);
+    FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(4);
+    FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(5);
+    FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(6);
+    FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(7);
+#undef FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW
+  }
+#endif
+
   static inline void qkt_tail(
       const float* Q, int64_t q_row_stride,
       const float* Kp, int64_t,
@@ -562,7 +783,283 @@ struct MK_Fp32PackK8PQuad {
   }
 };
 
-template <bool kCausal, bool kHasMask>
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+struct MK_Fp32PackK8PQuadSve : MK_Fp32PackK8PQuad {
+  static constexpr const char* kName = "fp32_packk8_pquad_sve";
+  static constexpr bool kSupportsQktNeonRowMax = false;
+
+  static inline void qkt_8x8(
+      const float* Q, int64_t q_row_stride,
+      const float* Kp, int64_t,
+      int64_t E, float scale,
+      float* scores_buf, int64_t scores_row_stride) {
+    if (svcntw() < 8) {
+      MK_Fp32PackK8PQuad::qkt_8x8(
+          Q, q_row_stride, Kp, 0, E, scale, scores_buf, scores_row_stride);
+      return;
+    }
+
+    const svbool_t pg = svptrue_pat_b32(SV_VL8);
+    svfloat32_t acc0 = svdup_f32(0.0f);
+    svfloat32_t acc1 = svdup_f32(0.0f);
+    svfloat32_t acc2 = svdup_f32(0.0f);
+    svfloat32_t acc3 = svdup_f32(0.0f);
+    svfloat32_t acc4 = svdup_f32(0.0f);
+    svfloat32_t acc5 = svdup_f32(0.0f);
+    svfloat32_t acc6 = svdup_f32(0.0f);
+    svfloat32_t acc7 = svdup_f32(0.0f);
+
+    const float* q0 = Q + 0 * q_row_stride;
+    const float* q1 = Q + 1 * q_row_stride;
+    const float* q2 = Q + 2 * q_row_stride;
+    const float* q3 = Q + 3 * q_row_stride;
+    const float* q4 = Q + 4 * q_row_stride;
+    const float* q5 = Q + 5 * q_row_stride;
+    const float* q6 = Q + 6 * q_row_stride;
+    const float* q7 = Q + 7 * q_row_stride;
+
+    int64_t e = 0;
+    constexpr int64_t kQktPrefetchDistance = 16;
+#define FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(ID, QV)                  \
+      do {                                                        \
+        acc##ID = svmla_lane_f32(acc##ID, k0, QV, 0);             \
+        acc##ID = svmla_lane_f32(acc##ID, k1, QV, 1);             \
+        acc##ID = svmla_lane_f32(acc##ID, k2, QV, 2);             \
+        acc##ID = svmla_lane_f32(acc##ID, k3, QV, 3);             \
+      } while (0)
+
+    for (; e + 4 <= E; e += 4) {
+      const int64_t e_pf = e + kQktPrefetchDistance;
+      if (e_pf < E) {
+        const float* k_pf = Kp + e_pf * 8;
+        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf);
+        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf + 16);
+      }
+
+      const svfloat32_t k0 = svld1_f32(pg, Kp + (e + 0) * 8);
+      const svfloat32_t k1 = svld1_f32(pg, Kp + (e + 1) * 8);
+      const svfloat32_t k2 = svld1_f32(pg, Kp + (e + 2) * 8);
+      const svfloat32_t k3 = svld1_f32(pg, Kp + (e + 3) * 8);
+      const svfloat32_t qv0 = svld1rq_f32(pg, q0 + e);
+      const svfloat32_t qv1 = svld1rq_f32(pg, q1 + e);
+      const svfloat32_t qv2 = svld1rq_f32(pg, q2 + e);
+      const svfloat32_t qv3 = svld1rq_f32(pg, q3 + e);
+      const svfloat32_t qv4 = svld1rq_f32(pg, q4 + e);
+      const svfloat32_t qv5 = svld1rq_f32(pg, q5 + e);
+      const svfloat32_t qv6 = svld1rq_f32(pg, q6 + e);
+      const svfloat32_t qv7 = svld1rq_f32(pg, q7 + e);
+      FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(0, qv0);
+      FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(1, qv1);
+      FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(2, qv2);
+      FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(3, qv3);
+      FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(4, qv4);
+      FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(5, qv5);
+      FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(6, qv6);
+      FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW(7, qv7);
+    }
+#undef FUSED_CPP_QKT_PACKK8_SVE_FMA_ROW
+
+    for (; e < E; ++e) {
+      const svfloat32_t k = svld1_f32(pg, Kp + e * 8);
+#define FUSED_CPP_QKT_PACKK8_SVE_TAIL(ID, QROW)                    \
+      acc##ID = svmla_n_f32_x(pg, acc##ID, k, QROW[e])
+      FUSED_CPP_QKT_PACKK8_SVE_TAIL(0, q0);
+      FUSED_CPP_QKT_PACKK8_SVE_TAIL(1, q1);
+      FUSED_CPP_QKT_PACKK8_SVE_TAIL(2, q2);
+      FUSED_CPP_QKT_PACKK8_SVE_TAIL(3, q3);
+      FUSED_CPP_QKT_PACKK8_SVE_TAIL(4, q4);
+      FUSED_CPP_QKT_PACKK8_SVE_TAIL(5, q5);
+      FUSED_CPP_QKT_PACKK8_SVE_TAIL(6, q6);
+      FUSED_CPP_QKT_PACKK8_SVE_TAIL(7, q7);
+#undef FUSED_CPP_QKT_PACKK8_SVE_TAIL
+    }
+
+    const svfloat32_t scale_v = svdup_f32(scale);
+#define FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(ID)                     \
+    svst1_f32(pg, scores_buf + (ID) * scores_row_stride,           \
+               svmul_f32_x(pg, acc##ID, scale_v))
+    FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(0);
+    FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(1);
+    FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(2);
+    FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(3);
+    FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(4);
+    FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(5);
+    FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(6);
+    FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(7);
+#undef FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW
+  }
+
+  static inline void qkt_4x32(
+      const float* Q, int64_t q_row_stride,
+      const float* Kp, int64_t,
+      int64_t E, float scale,
+      float* scores_buf, int64_t scores_row_stride) {
+    if (svcntw() < 8) {
+      for (int block = 0; block < 4; ++block) {
+        qkt_packk8_tail_scalar(
+            Q, q_row_stride, Kp + block * E * 8, E, scale,
+            scores_buf + block * 8, scores_row_stride, 4, 8);
+      }
+      return;
+    }
+
+    const svbool_t pg = svptrue_pat_b32(SV_VL8);
+    svfloat32_t c00 = svdup_f32(0.0f);
+    svfloat32_t c01 = svdup_f32(0.0f);
+    svfloat32_t c02 = svdup_f32(0.0f);
+    svfloat32_t c03 = svdup_f32(0.0f);
+    svfloat32_t c10 = svdup_f32(0.0f);
+    svfloat32_t c11 = svdup_f32(0.0f);
+    svfloat32_t c12 = svdup_f32(0.0f);
+    svfloat32_t c13 = svdup_f32(0.0f);
+    svfloat32_t c20 = svdup_f32(0.0f);
+    svfloat32_t c21 = svdup_f32(0.0f);
+    svfloat32_t c22 = svdup_f32(0.0f);
+    svfloat32_t c23 = svdup_f32(0.0f);
+    svfloat32_t c30 = svdup_f32(0.0f);
+    svfloat32_t c31 = svdup_f32(0.0f);
+    svfloat32_t c32 = svdup_f32(0.0f);
+    svfloat32_t c33 = svdup_f32(0.0f);
+
+    const float* q0 = Q + 0 * q_row_stride;
+    const float* q1 = Q + 1 * q_row_stride;
+    const float* q2 = Q + 2 * q_row_stride;
+    const float* q3 = Q + 3 * q_row_stride;
+    const float* k0_base = Kp + 0 * E * 8;
+    const float* k1_base = Kp + 1 * E * 8;
+    const float* k2_base = Kp + 2 * E * 8;
+    const float* k3_base = Kp + 3 * E * 8;
+
+#define FUSED_CPP_QKT_4X32_SVE_APPLY(ID, A, B0, B1, B2, B3)       \
+    do {                                                          \
+      c##ID##0 = svmla_f32_x(pg, c##ID##0, B0, A);                \
+      c##ID##1 = svmla_f32_x(pg, c##ID##1, B1, A);                \
+      c##ID##2 = svmla_f32_x(pg, c##ID##2, B2, A);                \
+      c##ID##3 = svmla_f32_x(pg, c##ID##3, B3, A);                \
+    } while (0)
+
+#define FUSED_CPP_QKT_4X32_SVE_PAIR(EA, EB)                       \
+    do {                                                          \
+      const int64_t ea = (EA);                                    \
+      const int64_t eb = (EB);                                    \
+      const svfloat32_t b0 = svld1_f32(pg, k0_base + ea * 8);     \
+      const svfloat32_t b1 = svld1_f32(pg, k1_base + ea * 8);     \
+      const svfloat32_t b2 = svld1_f32(pg, k2_base + ea * 8);     \
+      const svfloat32_t b3 = svld1_f32(pg, k3_base + ea * 8);     \
+      const svfloat32_t n0 = svld1_f32(pg, k0_base + eb * 8);     \
+      const svfloat32_t n1 = svld1_f32(pg, k1_base + eb * 8);     \
+      const svfloat32_t n2 = svld1_f32(pg, k2_base + eb * 8);     \
+      const svfloat32_t n3 = svld1_f32(pg, k3_base + eb * 8);     \
+      const svfloat32_t a0 = svdup_f32(q0[ea]);                   \
+      const svfloat32_t a1 = svdup_f32(q1[ea]);                   \
+      const svfloat32_t a2 = svdup_f32(q2[ea]);                   \
+      const svfloat32_t a3 = svdup_f32(q3[ea]);                   \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(0, a0, b0, b1, b2, b3);        \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(1, a1, b0, b1, b2, b3);        \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(2, a2, b0, b1, b2, b3);        \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(3, a3, b0, b1, b2, b3);        \
+      const svfloat32_t an0 = svdup_f32(q0[eb]);                  \
+      const svfloat32_t an1 = svdup_f32(q1[eb]);                  \
+      const svfloat32_t an2 = svdup_f32(q2[eb]);                  \
+      const svfloat32_t an3 = svdup_f32(q3[eb]);                  \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(0, an0, n0, n1, n2, n3);       \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(1, an1, n0, n1, n2, n3);       \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(2, an2, n0, n1, n2, n3);       \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(3, an3, n0, n1, n2, n3);       \
+    } while (0)
+
+#define FUSED_CPP_QKT_4X32_SVE_STEP(EE)                           \
+    do {                                                          \
+      const int64_t ee = (EE);                                    \
+      const svfloat32_t b0 = svld1_f32(pg, k0_base + ee * 8);     \
+      const svfloat32_t b1 = svld1_f32(pg, k1_base + ee * 8);     \
+      const svfloat32_t b2 = svld1_f32(pg, k2_base + ee * 8);     \
+      const svfloat32_t b3 = svld1_f32(pg, k3_base + ee * 8);     \
+      const svfloat32_t a0 = svdup_f32(q0[ee]);                   \
+      const svfloat32_t a1 = svdup_f32(q1[ee]);                   \
+      const svfloat32_t a2 = svdup_f32(q2[ee]);                   \
+      const svfloat32_t a3 = svdup_f32(q3[ee]);                   \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(0, a0, b0, b1, b2, b3);        \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(1, a1, b0, b1, b2, b3);        \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(2, a2, b0, b1, b2, b3);        \
+      FUSED_CPP_QKT_4X32_SVE_APPLY(3, a3, b0, b1, b2, b3);        \
+    } while (0)
+
+    int64_t e = 0;
+    constexpr int64_t kQktPrefetchDistance = 16;
+    for (; e + 8 <= E; e += 8) {
+      const int64_t e_pf = e + kQktPrefetchDistance;
+      if (e_pf < E) {
+        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(
+            k0_base + e_pf * 8);
+        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(
+            k1_base + e_pf * 8);
+        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(
+            k2_base + e_pf * 8);
+        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(
+            k3_base + e_pf * 8);
+      }
+      FUSED_CPP_QKT_4X32_SVE_PAIR(e + 0, e + 1);
+      FUSED_CPP_QKT_4X32_SVE_PAIR(e + 2, e + 3);
+      FUSED_CPP_QKT_4X32_SVE_PAIR(e + 4, e + 5);
+      FUSED_CPP_QKT_4X32_SVE_PAIR(e + 6, e + 7);
+    }
+    for (; e < E; ++e) {
+      FUSED_CPP_QKT_4X32_SVE_STEP(e);
+    }
+
+    const svfloat32_t scale_v = svdup_f32(scale);
+#define FUSED_CPP_QKT_4X32_SVE_STORE_ROW(ID)                      \
+    do {                                                          \
+      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 0,    \
+                 svmul_f32_x(pg, c##ID##0, scale_v));             \
+      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 8,    \
+                 svmul_f32_x(pg, c##ID##1, scale_v));             \
+      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 16,   \
+                 svmul_f32_x(pg, c##ID##2, scale_v));             \
+      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 24,   \
+                 svmul_f32_x(pg, c##ID##3, scale_v));             \
+    } while (0)
+    FUSED_CPP_QKT_4X32_SVE_STORE_ROW(0);
+    FUSED_CPP_QKT_4X32_SVE_STORE_ROW(1);
+    FUSED_CPP_QKT_4X32_SVE_STORE_ROW(2);
+    FUSED_CPP_QKT_4X32_SVE_STORE_ROW(3);
+#undef FUSED_CPP_QKT_4X32_SVE_STORE_ROW
+#undef FUSED_CPP_QKT_4X32_SVE_STEP
+#undef FUSED_CPP_QKT_4X32_SVE_PAIR
+#undef FUSED_CPP_QKT_4X32_SVE_APPLY
+  }
+
+  static inline void pv_8x8(
+      const float* P_hat, int64_t P_row_stride,
+      const float* V, int64_t v_row_stride,
+      int64_t Sk,
+      float* O, int64_t o_row_stride) {
+    if (!::fused_cpp::sdpa_microkernels::gemm_pv_microkernel_8x8_fp32_pquad_sve(
+            P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride)) {
+      MK_Fp32PackK8PQuad::pv_8x8(
+          P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
+    }
+  }
+
+  static inline void pv_8x16(
+      const float* P_hat, int64_t P_row_stride,
+      const float* V_lo, const float* V_hi,
+      int64_t v_row_stride,
+      int64_t Sk,
+      float* O, int64_t o_row_stride) {
+    if (!::fused_cpp::sdpa_microkernels::gemm_pv_microkernel_8x16_fp32_pquad_sve(
+            P_hat, P_row_stride, V_lo, V_hi, v_row_stride, Sk, O, o_row_stride)) {
+      MK_Fp32PackK8PQuad::pv_8x8(
+          P_hat, P_row_stride, V_lo, v_row_stride, Sk, O, o_row_stride);
+      MK_Fp32PackK8PQuad::pv_8x8(
+          P_hat, P_row_stride, V_hi, v_row_stride, Sk, O + 8, o_row_stride);
+    }
+  }
+};
+#endif
+
+template <typename MK, bool kCausal, bool kHasMask>
 void run_fp32_packk_path(
     const float* q_ptr,
     const float* k_packed_ptr,
@@ -590,7 +1087,7 @@ void run_fp32_packk_path(
 
   FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMain);
   if (path_a) {
-    run_path_collapse3<MK_Fp32PackK8PQuad, float, true, kHasMask, kCausal>(
+    run_path_collapse3<MK, float, true, kHasMask, kCausal>(
         q_ptr, k_packed_ptr, v_packed_ptr, p, ts,
         q_stride.b, q_stride.n, q_stride.t,
         k_packed_stride_b, k_packed_stride_n, k_packed_stride_s,
@@ -600,7 +1097,7 @@ void run_fp32_packk_path(
         out_stride.b, out_stride.n, out_stride.t);
   } else {
     const int64_t num_groups = std::max<int64_t>(1, total_threads);
-    run_path_taskloop<MK_Fp32PackK8PQuad, float, true, kHasMask, kCausal>(
+    run_path_taskloop<MK, float, true, kHasMask, kCausal>(
         q_ptr, k_packed_ptr, v_packed_ptr, p, ts, static_cast<int>(num_groups),
         q_stride.b, q_stride.n, q_stride.t,
         k_packed_stride_b, k_packed_stride_n, k_packed_stride_s,
@@ -611,7 +1108,7 @@ void run_fp32_packk_path(
   }
 }
 
-template <bool kCausal, bool kHasMask>
+template <typename MK, bool kCausal, bool kHasMask>
 void run_fp32_packk_path_per_head(
     const float* q_ptr,
     const float* k_ptr,
@@ -695,13 +1192,72 @@ void run_fp32_packk_path_per_head(
         p_head.lse_ptr = p.lse_ptr + (b * p.N + n) * p.L;
       }
 
-      run_fp32_packk_path<kCausal, kHasMask>(
+      run_fp32_packk_path<MK, kCausal, kHasMask>(
           q_head, k_packed.data(), v_packed.data(), p_head, ts, path_a,
           total_threads,
           ElementStrides{0, 0, q_stride.t, q_stride.d},
           ElementStrides{0, 0, out_stride.t, out_stride.d});
     }
   }
+}
+
+template <bool kCausal, bool kHasMask>
+void run_selected_fp32_packk_path(
+    const float* q_ptr,
+    const float* k_packed_ptr,
+    const float* v_packed_ptr,
+    const SdpaParams& p,
+    const TileSizes& ts,
+    bool path_a,
+    int total_threads,
+    ElementStrides q_stride,
+    ElementStrides out_stride) {
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+  if (use_sve_microkernels()) {
+    run_fp32_packk_path<MK_Fp32PackK8PQuadSve, kCausal, kHasMask>(
+        q_ptr, k_packed_ptr, v_packed_ptr, p, ts, path_a, total_threads,
+        q_stride, out_stride);
+    return;
+  }
+#endif
+  run_fp32_packk_path<MK_Fp32PackK8PQuad, kCausal, kHasMask>(
+      q_ptr, k_packed_ptr, v_packed_ptr, p, ts, path_a, total_threads,
+      q_stride, out_stride);
+}
+
+template <bool kCausal, bool kHasMask>
+void run_selected_fp32_packk_path_per_head(
+    const float* q_ptr,
+    const float* k_ptr,
+    const float* v_ptr,
+    const SdpaParams& p,
+    const TileSizes& ts,
+    bool path_a,
+    int total_threads,
+    ElementStrides q_stride,
+    ElementStrides k_stride,
+    ElementStrides v_stride,
+    ElementStrides out_stride) {
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+  if (use_sve_microkernels()) {
+    run_fp32_packk_path_per_head<MK_Fp32PackK8PQuadSve, kCausal, kHasMask>(
+        q_ptr, k_ptr, v_ptr, p, ts, path_a, total_threads,
+        q_stride, k_stride, v_stride, out_stride);
+    return;
+  }
+#endif
+  run_fp32_packk_path_per_head<MK_Fp32PackK8PQuad, kCausal, kHasMask>(
+      q_ptr, k_ptr, v_ptr, p, ts, path_a, total_threads,
+      q_stride, k_stride, v_stride, out_stride);
+}
+
+const char* selected_mk_name() {
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+  if (use_sve_microkernels()) {
+    return MK_Fp32PackK8PQuadSve::kName;
+  }
+#endif
+  return MK_Fp32PackK8PQuad::kName;
 }
 
 int64_t byte_stride_to_float_elems(int64_t byte_stride) {
@@ -825,21 +1381,21 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
   if (pack_per_head) {
     if (cfg.causal) {
       if (has_mask) {
-        run_fp32_packk_path_per_head<true, true>(
+        run_selected_fp32_packk_path_per_head<true, true>(
             q, k, v, p, ts, path_a, total_threads,
             q_stride, k_stride, v_stride, out_stride);
       } else {
-        run_fp32_packk_path_per_head<true, false>(
+        run_selected_fp32_packk_path_per_head<true, false>(
             q, k, v, p, ts, path_a, total_threads,
             q_stride, k_stride, v_stride, out_stride);
       }
     } else {
       if (has_mask) {
-        run_fp32_packk_path_per_head<false, true>(
+        run_selected_fp32_packk_path_per_head<false, true>(
             q, k, v, p, ts, path_a, total_threads,
             q_stride, k_stride, v_stride, out_stride);
       } else {
-        run_fp32_packk_path_per_head<false, false>(
+        run_selected_fp32_packk_path_per_head<false, false>(
             q, k, v, p, ts, path_a, total_threads,
             q_stride, k_stride, v_stride, out_stride);
       }
@@ -871,21 +1427,21 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
 
     if (cfg.causal) {
       if (has_mask) {
-        run_fp32_packk_path<true, true>(
+        run_selected_fp32_packk_path<true, true>(
             q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads,
             q_stride, out_stride);
       } else {
-        run_fp32_packk_path<true, false>(
+        run_selected_fp32_packk_path<true, false>(
             q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads,
             q_stride, out_stride);
       }
     } else {
       if (has_mask) {
-        run_fp32_packk_path<false, true>(
+        run_selected_fp32_packk_path<false, true>(
             q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads,
             q_stride, out_stride);
       } else {
-        run_fp32_packk_path<false, false>(
+        run_selected_fp32_packk_path<false, false>(
             q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads,
             q_stride, out_stride);
       }
@@ -898,7 +1454,7 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
         ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
     ::fused_cpp::sdpa_profile::print_summary(
         "fp32_packqkv_standalone",
-        MK_Fp32PackK8PQuad::kName,
+        selected_mk_name(),
         p,
         pack_per_head ? (path_a ? "A-per-head" : "B-per-head")
                       : (path_a ? "A" : "B"));

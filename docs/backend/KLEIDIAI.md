@@ -149,6 +149,30 @@ SME behavior can be controlled with `GGML_KLEIDIAI_SME`:
 The KleidiAI chunk multiplier can be controlled with
 `GGML_KLEIDIAI_CHUNK_MULTIPLIER` when tuning thread partitioning.
 
+The fused_cpp embedding SDPA path is separate from KleidiAI matmul kernels. It
+is enabled with `GGML_FUSED_CPP_SDPA=1` and, by default, uses the NEON QKT/PV
+microkernels. The default path skips the online-softmax correction rescale when
+there is no previous S-block contribution, because the running accumulator is
+still zero.
+
+`FUSED_CPP_SDPA_QKT_ROWMAX=1` enables the experimental NEON QKT row-max fusion.
+It updates the per-row score maximum while QKT writes the score tile, then lets
+softmax skip its separate max scan. On Arm-codex, with single-core
+`B=1,H=8,L=512,S=512,D=64,DV=64` and an all-zero f16 mask, this measured
+9.71 ms, roughly the same as the default path after correction-rescale skip.
+Keep it opt-in because the gain is small and shape-dependent.
+
+For local kernel experiments, `FUSED_CPP_SDPA_USE_SVE_KERNELS=1` selects the
+SVE QKT/PV microkernels when the binary is built on AArch64 with SVE compiler
+support. This is opt-in because it is not faster on every SVE width. On
+Arm-codex with 256-bit SVE, single-core Q8 embedding at input length 512 was
+faster with the default NEON path than with the SVE path, so leave this unset
+unless explicitly profiling the SVE kernels.
+
+`FUSED_CPP_SDPA_USE_SVE_QKT_4X32=1` additionally enables the experimental SVE
+QKT 4x32 kernel. This is only for profiling; on Arm-codex it was slower than
+the default SVE QKT path because it reloads each K tile for two 4-row halves.
+
 ## Common issues
 
 If CMake still downloads KleidiAI after you provided a local source tree,

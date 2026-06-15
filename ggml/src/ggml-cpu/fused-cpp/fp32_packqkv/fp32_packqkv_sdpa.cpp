@@ -99,7 +99,8 @@ void pack_k_fp32_to_sblock8_one_head_strided(
     float* k_dst,
     int64_t S,
     int64_t E,
-    ElementStrides k_stride) {
+    ElementStrides k_stride,
+    float scale) {
   const int64_t S_blocks = ceil_div8_i64(S);
   const int64_t dst_stride_sb = E * 8;
 
@@ -112,29 +113,29 @@ void pack_k_fp32_to_sblock8_one_head_strided(
       float* d = dst + e * 8;
       const int64_t ed = e * k_stride.d;
       if (remain >= 8) {
-        d[0] = src[0 * k_stride.t + ed];
-        d[1] = src[1 * k_stride.t + ed];
-        d[2] = src[2 * k_stride.t + ed];
-        d[3] = src[3 * k_stride.t + ed];
-        d[4] = src[4 * k_stride.t + ed];
-        d[5] = src[5 * k_stride.t + ed];
-        d[6] = src[6 * k_stride.t + ed];
-        d[7] = src[7 * k_stride.t + ed];
+        d[0] = src[0 * k_stride.t + ed] * scale;
+        d[1] = src[1 * k_stride.t + ed] * scale;
+        d[2] = src[2 * k_stride.t + ed] * scale;
+        d[3] = src[3 * k_stride.t + ed] * scale;
+        d[4] = src[4 * k_stride.t + ed] * scale;
+        d[5] = src[5 * k_stride.t + ed] * scale;
+        d[6] = src[6 * k_stride.t + ed] * scale;
+        d[7] = src[7 * k_stride.t + ed] * scale;
       } else {
         const int64_t tail = std::max<int64_t>(0, remain);
         int64_t j = 0;
         for (; j + 4 <= tail; j += 4) {
-          d[j + 0] = src[(j + 0) * k_stride.t + ed];
-          d[j + 1] = src[(j + 1) * k_stride.t + ed];
-          d[j + 2] = src[(j + 2) * k_stride.t + ed];
-          d[j + 3] = src[(j + 3) * k_stride.t + ed];
+          d[j + 0] = src[(j + 0) * k_stride.t + ed] * scale;
+          d[j + 1] = src[(j + 1) * k_stride.t + ed] * scale;
+          d[j + 2] = src[(j + 2) * k_stride.t + ed] * scale;
+          d[j + 3] = src[(j + 3) * k_stride.t + ed] * scale;
         }
         for (; j + 2 <= tail; j += 2) {
-          d[j + 0] = src[(j + 0) * k_stride.t + ed];
-          d[j + 1] = src[(j + 1) * k_stride.t + ed];
+          d[j + 0] = src[(j + 0) * k_stride.t + ed] * scale;
+          d[j + 1] = src[(j + 1) * k_stride.t + ed] * scale;
         }
         for (; j < tail; ++j) {
-          d[j] = src[j * k_stride.t + ed];
+          d[j] = src[j * k_stride.t + ed] * scale;
         }
         for (; j < 8; ++j) {
           d[j] = 0.0f;
@@ -151,7 +152,8 @@ void pack_k_fp32_to_sblock8_strided(
     int64_t N,
     int64_t S,
     int64_t E,
-    ElementStrides k_stride);
+    ElementStrides k_stride,
+    float scale);
 
 void pack_k_fp32_to_sblock8_strided(
     const float* k_src,
@@ -160,7 +162,8 @@ void pack_k_fp32_to_sblock8_strided(
     int64_t N,
     int64_t S,
     int64_t E,
-    ElementStrides k_stride) {
+    ElementStrides k_stride,
+    float scale) {
   const int64_t S_blocks = ceil_div8_i64(S);
   const int64_t dst_stride_b = N * S_blocks * E * 8;
   const int64_t dst_stride_n = S_blocks * E * 8;
@@ -184,29 +187,29 @@ void pack_k_fp32_to_sblock8_strided(
           float* d = dst + e * 8;
           const int64_t ed = e * k_stride.d;
           if (remain >= 8) {
-            d[0] = src[0 * k_stride.t + ed];
-            d[1] = src[1 * k_stride.t + ed];
-            d[2] = src[2 * k_stride.t + ed];
-            d[3] = src[3 * k_stride.t + ed];
-            d[4] = src[4 * k_stride.t + ed];
-            d[5] = src[5 * k_stride.t + ed];
-            d[6] = src[6 * k_stride.t + ed];
-            d[7] = src[7 * k_stride.t + ed];
+            d[0] = src[0 * k_stride.t + ed] * scale;
+            d[1] = src[1 * k_stride.t + ed] * scale;
+            d[2] = src[2 * k_stride.t + ed] * scale;
+            d[3] = src[3 * k_stride.t + ed] * scale;
+            d[4] = src[4 * k_stride.t + ed] * scale;
+            d[5] = src[5 * k_stride.t + ed] * scale;
+            d[6] = src[6 * k_stride.t + ed] * scale;
+            d[7] = src[7 * k_stride.t + ed] * scale;
           } else {
             const int64_t tail = std::max<int64_t>(0, remain);
             int64_t j = 0;
             for (; j + 4 <= tail; j += 4) {
-              d[j + 0] = src[(j + 0) * k_stride.t + ed];
-              d[j + 1] = src[(j + 1) * k_stride.t + ed];
-              d[j + 2] = src[(j + 2) * k_stride.t + ed];
-              d[j + 3] = src[(j + 3) * k_stride.t + ed];
+              d[j + 0] = src[(j + 0) * k_stride.t + ed] * scale;
+              d[j + 1] = src[(j + 1) * k_stride.t + ed] * scale;
+              d[j + 2] = src[(j + 2) * k_stride.t + ed] * scale;
+              d[j + 3] = src[(j + 3) * k_stride.t + ed] * scale;
             }
             for (; j + 2 <= tail; j += 2) {
-              d[j + 0] = src[(j + 0) * k_stride.t + ed];
-              d[j + 1] = src[(j + 1) * k_stride.t + ed];
+              d[j + 0] = src[(j + 0) * k_stride.t + ed] * scale;
+              d[j + 1] = src[(j + 1) * k_stride.t + ed] * scale;
             }
             for (; j < tail; ++j) {
-              d[j] = src[j * k_stride.t + ed];
+              d[j] = src[j * k_stride.t + ed] * scale;
             }
             for (; j < 8; ++j) {
               d[j] = 0.0f;
@@ -312,6 +315,9 @@ inline void qkt_packk8_tail_scalar(
     int64_t scores_row_stride,
     int Lq,
     int Sk) {
+  // scale is folded into packed K (see pack_k_fp32_to_sblock8_*), so the
+  // dot product is already scaled here.
+  (void)scale;
   for (int i = 0; i < Lq; ++i) {
     const float* q = Q + i * q_row_stride;
     float* out = scores_buf + i * scores_row_stride;
@@ -320,7 +326,7 @@ inline void qkt_packk8_tail_scalar(
       for (int64_t e = 0; e < E; ++e) {
         sum += q[e] * Kp[e * 8 + j];
       }
-      out[j] = sum * scale;
+      out[j] = sum;
     }
   }
 }
@@ -429,13 +435,11 @@ struct MK_Fp32PackK8PQuad {
 #undef FUSED_CPP_QKT_PACKK8_FMA_TAIL
     }
 
-    const float32x4_t scale_v = vdupq_n_f32(scale);
+    (void)scale;  // scale folded into packed K
 #define FUSED_CPP_QKT_PACKK8_STORE_ROW(ID)                         \
     do {                                                           \
-      vst1q_f32(scores_buf + (ID) * scores_row_stride + 0,         \
-                vmulq_f32(lo##ID, scale_v));                       \
-      vst1q_f32(scores_buf + (ID) * scores_row_stride + 4,         \
-                vmulq_f32(hi##ID, scale_v));                       \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride + 0, lo##ID); \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride + 4, hi##ID); \
     } while (0)
     FUSED_CPP_QKT_PACKK8_STORE_ROW(0);
     FUSED_CPP_QKT_PACKK8_STORE_ROW(1);
@@ -548,15 +552,13 @@ struct MK_Fp32PackK8PQuad {
 #undef FUSED_CPP_QKT_PACKK8_ROWMAX_FMA_TAIL
     }
 
-    const float32x4_t scale_v = vdupq_n_f32(scale);
+    (void)scale;  // scale folded into packed K
 #define FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(ID)                 \
     do {                                                          \
-      const float32x4_t slo = vmulq_f32(lo##ID, scale_v);         \
-      const float32x4_t shi = vmulq_f32(hi##ID, scale_v);         \
-      row_max_lo[ID] = vmaxq_f32(row_max_lo[ID], slo);            \
-      row_max_hi[ID] = vmaxq_f32(row_max_hi[ID], shi);            \
-      vst1q_f32(scores_buf + (ID) * scores_row_stride + 0, slo);  \
-      vst1q_f32(scores_buf + (ID) * scores_row_stride + 4, shi);  \
+      row_max_lo[ID] = vmaxq_f32(row_max_lo[ID], lo##ID);         \
+      row_max_hi[ID] = vmaxq_f32(row_max_hi[ID], hi##ID);         \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride + 0, lo##ID); \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride + 4, hi##ID); \
     } while (0)
     FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(0);
     FUSED_CPP_QKT_PACKK8_ROWMAX_STORE_ROW(1);
@@ -639,10 +641,9 @@ struct MK_Fp32PackK8PQuad {
       FUSED_CPP_QKT_PACKK4_FMA_TAIL(7, q7);
 #undef FUSED_CPP_QKT_PACKK4_FMA_TAIL
     }
-    const float32x4_t scale_v = vdupq_n_f32(scale);
+    (void)scale;  // scale folded into packed K
 #define FUSED_CPP_QKT_PACKK4_STORE_ROW(ID)                         \
-    vst1q_f32(scores_buf + (ID) * scores_row_stride,               \
-              vmulq_f32(acc##ID, scale_v))
+    vst1q_f32(scores_buf + (ID) * scores_row_stride, acc##ID)
     FUSED_CPP_QKT_PACKK4_STORE_ROW(0);
     FUSED_CPP_QKT_PACKK4_STORE_ROW(1);
     FUSED_CPP_QKT_PACKK4_STORE_ROW(2);
@@ -729,12 +730,11 @@ struct MK_Fp32PackK8PQuad {
 #undef FUSED_CPP_QKT_PACKK4_ROWMAX_FMA_TAIL
     }
 
-    const float32x4_t scale_v = vdupq_n_f32(scale);
+    (void)scale;  // scale folded into packed K
 #define FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(ID)                 \
     do {                                                          \
-      const float32x4_t s = vmulq_f32(acc##ID, scale_v);          \
-      row_max_lo[ID] = vmaxq_f32(row_max_lo[ID], s);              \
-      vst1q_f32(scores_buf + (ID) * scores_row_stride, s);        \
+      row_max_lo[ID] = vmaxq_f32(row_max_lo[ID], acc##ID);        \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride, acc##ID);  \
     } while (0)
     FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(0);
     FUSED_CPP_QKT_PACKK4_ROWMAX_STORE_ROW(1);
@@ -874,10 +874,9 @@ struct MK_Fp32PackK8PQuadSve : MK_Fp32PackK8PQuad {
 #undef FUSED_CPP_QKT_PACKK8_SVE_TAIL
     }
 
-    const svfloat32_t scale_v = svdup_f32(scale);
+    // scale folded into packed K
 #define FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(ID)                     \
-    svst1_f32(pg, scores_buf + (ID) * scores_row_stride,           \
-               svmul_f32_x(pg, acc##ID, scale_v))
+    svst1_f32(pg, scores_buf + (ID) * scores_row_stride, acc##ID)
     FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(0);
     FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(1);
     FUSED_CPP_QKT_PACKK8_SVE_STORE_ROW(2);
@@ -1008,17 +1007,13 @@ struct MK_Fp32PackK8PQuadSve : MK_Fp32PackK8PQuad {
       FUSED_CPP_QKT_4X32_SVE_STEP(e);
     }
 
-    const svfloat32_t scale_v = svdup_f32(scale);
+    // scale folded into packed K
 #define FUSED_CPP_QKT_4X32_SVE_STORE_ROW(ID)                      \
     do {                                                          \
-      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 0,    \
-                 svmul_f32_x(pg, c##ID##0, scale_v));             \
-      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 8,    \
-                 svmul_f32_x(pg, c##ID##1, scale_v));             \
-      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 16,   \
-                 svmul_f32_x(pg, c##ID##2, scale_v));             \
-      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 24,   \
-                 svmul_f32_x(pg, c##ID##3, scale_v));             \
+      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 0,  c##ID##0); \
+      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 8,  c##ID##1); \
+      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 16, c##ID##2); \
+      svst1_f32(pg, scores_buf + (ID) * scores_row_stride + 24, c##ID##3); \
     } while (0)
     FUSED_CPP_QKT_4X32_SVE_STORE_ROW(0);
     FUSED_CPP_QKT_4X32_SVE_STORE_ROW(1);
@@ -1150,7 +1145,7 @@ void run_fp32_packk_path_per_head(
       {
         FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
         pack_k_fp32_to_sblock8_one_head_strided(
-            k_head, k_packed.data(), p.S, p.E, k_stride);
+            k_head, k_packed.data(), p.S, p.E, k_stride, p.scale_f);
       }
 
       SdpaParams p_head = p;
@@ -1422,7 +1417,7 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
     {
       FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
       pack_k_fp32_to_sblock8_strided(
-          k, k_packed.data(), cfg.B, cfg.N, cfg.S, cfg.E, k_stride);
+          k, k_packed.data(), cfg.B, cfg.N, cfg.S, cfg.E, k_stride, cfg.scale);
     }
 
     if (cfg.causal) {

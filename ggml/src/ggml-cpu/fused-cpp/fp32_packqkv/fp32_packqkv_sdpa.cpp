@@ -1119,13 +1119,17 @@ void run_fp32_packk_path_per_head(
   const int64_t S_blocks = ceil_div8_i64(p.S);
   const int64_t Eb = p.Ev / 8;
 
-  AlignedVector<float> v_packed;
+  // Reused across calls (grow-only): the pack functions below overwrite every
+  // element they read (including zero-padded tails), so stale contents are
+  // never observed. thread_local keeps one buffer per worker; the OMP pack
+  // writes disjoint regions through the shared data() pointer.
+  static thread_local AlignedVector<float> v_packed;
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVAlloc);
     v_packed.resize(static_cast<size_t>(Eb * p.S * 8));
   }
 
-  AlignedVector<float> k_packed;
+  static thread_local AlignedVector<float> k_packed;
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKAlloc);
     k_packed.resize(static_cast<size_t>(S_blocks * p.E * 8));

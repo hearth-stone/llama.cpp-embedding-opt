@@ -204,9 +204,9 @@ static inline float32x4_t vexpq_f32_poly_impl(float32x4_t x) {
   const float32x4_t c5 = vdupq_n_f32(0.00833333f);
   const float32x4_t c6 = vdupq_n_f32(0.0013888889f);
 
-  const float32x4_t kHi = vdupq_n_f32(87.0f);
   const float32x4_t kLo = vdupq_n_f32(-87.0f);
-  x = vminq_f32(x, kHi);
+  // softmax inputs are x = score - row_max <= 0, so the upper clamp at +87 is
+  // never reached; keep only the lower clamp (maps masked -inf lanes to ~0).
   x = vmaxq_f32(x, kLo);
 
   float32x4_t fn = vrndnq_f32(vmulq_f32(x, kInvLn2));
@@ -250,9 +250,8 @@ template <int kDegree = FUSED_CPP_SDPA_SOFTMAX_EXP_POLY_DEGREE>
 static inline svfloat32_t svexp_poly_f32_impl(svbool_t pg, svfloat32_t x) {
   static_assert(kDegree == 4 || kDegree == 5 || kDegree == 6,
                 "svexp_poly_f32_impl supports degree 4, 5, or 6");
-  const svfloat32_t kHi = svdup_f32(87.0f);
   const svfloat32_t kLo = svdup_f32(-87.0f);
-  x = svmin_f32_x(pg, x, kHi);
+  // x = score - row_max <= 0; upper clamp at +87 is dead, keep only the lower.
   x = svmax_f32_x(pg, x, kLo);
 
   const svfloat32_t kInvLn2 = svdup_f32(1.4426950408889634f);

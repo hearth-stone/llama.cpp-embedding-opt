@@ -33,7 +33,7 @@ using ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv;
 using ::fused_cpp::sdpa_tile_sizes::effective_cache_bytes;
 using ::fused_cpp::sdpa_tile_sizes::TileSizes;
 
-constexpr int64_t kEvBlock = 8;
+constexpr int64_t kEvBlock = 4;
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
 struct ElementStrides {
@@ -62,6 +62,10 @@ inline int64_t clamp_i64(int64_t v, int64_t lo, int64_t hi) {
 
 inline int64_t ceil_div8_i64(int64_t v) {
   return (v + 7) / 8;
+}
+
+inline int64_t ceil_div4_i64(int64_t v) {
+  return (v + 3) / 4;
 }
 
 bool env_flag_enabled(const char* name) {
@@ -94,58 +98,44 @@ inline void check_config(const Config& cfg) {
     throw std::invalid_argument("shape dimensions must be positive");
   }
   if (cfg.Ev % kEvBlock != 0) {
-    throw std::invalid_argument("fp32 packqkv path requires Ev % 8 == 0");
+    throw std::invalid_argument("fp32 packqkv path requires Ev % 4 == 0");
   }
-  if (cfg.s_tile < 0 || cfg.s_tile % 8 != 0) {
+  if (cfg.s_tile < 0 || cfg.s_tile % 4 != 0) {
     throw std::invalid_argument(
-        "fp32 packqkv path requires s_tile == 0 or s_tile % 8 == 0");
+        "fp32 packqkv path requires s_tile == 0 or s_tile % 4 == 0");
   }
 }
 
-void pack_k_fp32_to_sblock8_one_head_strided(
+void pack_k_fp32_to_sblock4_one_head_strided(
     const float* k_src,
     float* k_dst,
     int64_t S,
     int64_t E,
     ElementStrides k_stride,
     float scale) {
-  const int64_t S_blocks = ceil_div8_i64(S);
-  const int64_t dst_stride_sb = E * 8;
+  const int64_t S_blocks = ceil_div4_i64(S);
+  const int64_t dst_stride_sb = E * 4;
 
   for (int64_t sb = 0; sb < S_blocks; ++sb) {
-    const int64_t s0 = sb * 8;
+    const int64_t s0 = sb * 4;
     const int64_t remain = S - s0;
     const float* src = k_src + s0 * k_stride.t;
     float* dst = k_dst + sb * dst_stride_sb;
     for (int64_t e = 0; e < E; ++e) {
-      float* d = dst + e * 8;
+      float* d = dst + e * 4;
       const int64_t ed = e * k_stride.d;
-      if (remain >= 8) {
+      if (remain >= 4) {
         d[0] = src[0 * k_stride.t + ed] * scale;
         d[1] = src[1 * k_stride.t + ed] * scale;
         d[2] = src[2 * k_stride.t + ed] * scale;
         d[3] = src[3 * k_stride.t + ed] * scale;
-        d[4] = src[4 * k_stride.t + ed] * scale;
-        d[5] = src[5 * k_stride.t + ed] * scale;
-        d[6] = src[6 * k_stride.t + ed] * scale;
-        d[7] = src[7 * k_stride.t + ed] * scale;
       } else {
         const int64_t tail = std::max<int64_t>(0, remain);
         int64_t j = 0;
-        for (; j + 4 <= tail; j += 4) {
-          d[j + 0] = src[(j + 0) * k_stride.t + ed] * scale;
-          d[j + 1] = src[(j + 1) * k_stride.t + ed] * scale;
-          d[j + 2] = src[(j + 2) * k_stride.t + ed] * scale;
-          d[j + 3] = src[(j + 3) * k_stride.t + ed] * scale;
-        }
-        for (; j + 2 <= tail; j += 2) {
-          d[j + 0] = src[(j + 0) * k_stride.t + ed] * scale;
-          d[j + 1] = src[(j + 1) * k_stride.t + ed] * scale;
-        }
         for (; j < tail; ++j) {
           d[j] = src[j * k_stride.t + ed] * scale;
         }
-        for (; j < 8; ++j) {
+        for (; j < 4; ++j) {
           d[j] = 0.0f;
         }
       }
@@ -172,10 +162,10 @@ void pack_k_fp32_to_sblock8_strided(
     int64_t E,
     ElementStrides k_stride,
     float scale) {
-  const int64_t S_blocks = ceil_div8_i64(S);
-  const int64_t dst_stride_b = N * S_blocks * E * 8;
-  const int64_t dst_stride_n = S_blocks * E * 8;
-  const int64_t dst_stride_sb = E * 8;
+  const int64_t S_blocks = ceil_div4_i64(S);
+  const int64_t dst_stride_b = N * S_blocks * E * 4;
+  const int64_t dst_stride_n = S_blocks * E * 4;
+  const int64_t dst_stride_sb = E * 4;
 
 #ifdef _OPENMP
   #pragma omp parallel for collapse(3) schedule(static)
@@ -183,7 +173,7 @@ void pack_k_fp32_to_sblock8_strided(
   for (int64_t b = 0; b < B; ++b) {
     for (int64_t n = 0; n < N; ++n) {
       for (int64_t sb = 0; sb < S_blocks; ++sb) {
-        const int64_t s0 = sb * 8;
+        const int64_t s0 = sb * 4;
         const int64_t remain = S - s0;
         const float* src = k_src + b * k_stride.b
                                  + n * k_stride.n
@@ -192,34 +182,20 @@ void pack_k_fp32_to_sblock8_strided(
                            + n * dst_stride_n
                            + sb * dst_stride_sb;
         for (int64_t e = 0; e < E; ++e) {
-          float* d = dst + e * 8;
+          float* d = dst + e * 4;
           const int64_t ed = e * k_stride.d;
-          if (remain >= 8) {
+          if (remain >= 4) {
             d[0] = src[0 * k_stride.t + ed] * scale;
             d[1] = src[1 * k_stride.t + ed] * scale;
             d[2] = src[2 * k_stride.t + ed] * scale;
             d[3] = src[3 * k_stride.t + ed] * scale;
-            d[4] = src[4 * k_stride.t + ed] * scale;
-            d[5] = src[5 * k_stride.t + ed] * scale;
-            d[6] = src[6 * k_stride.t + ed] * scale;
-            d[7] = src[7 * k_stride.t + ed] * scale;
           } else {
             const int64_t tail = std::max<int64_t>(0, remain);
             int64_t j = 0;
-            for (; j + 4 <= tail; j += 4) {
-              d[j + 0] = src[(j + 0) * k_stride.t + ed] * scale;
-              d[j + 1] = src[(j + 1) * k_stride.t + ed] * scale;
-              d[j + 2] = src[(j + 2) * k_stride.t + ed] * scale;
-              d[j + 3] = src[(j + 3) * k_stride.t + ed] * scale;
-            }
-            for (; j + 2 <= tail; j += 2) {
-              d[j + 0] = src[(j + 0) * k_stride.t + ed] * scale;
-              d[j + 1] = src[(j + 1) * k_stride.t + ed] * scale;
-            }
             for (; j < tail; ++j) {
               d[j] = src[j * k_stride.t + ed] * scale;
             }
-            for (; j < 8; ++j) {
+            for (; j < 4; ++j) {
               d[j] = 0.0f;
             }
           }
@@ -229,26 +205,29 @@ void pack_k_fp32_to_sblock8_strided(
   }
 }
 
-void pack_v_to_evblock8_one_head_strided(
+void pack_v_to_evblock4_one_head_strided(
     const float* v_src,
     float* v_dst,
     int64_t S,
     int64_t Ev,
     ElementStrides v_stride) {
-  const int64_t Eb = Ev / 8;
-  const int64_t evblock_stride_dst = S * 8;
+  const int64_t Eb = Ev / 4;
+  const int64_t evblock_stride_dst = S * 4;
 
   for (int64_t eb = 0; eb < Eb; ++eb) {
-    const int64_t ev = eb * 8;
+    const int64_t ev = eb * 4;
     const float* src = v_src + ev * v_stride.d;
     float* dst = v_dst + eb * evblock_stride_dst;
     for (int64_t s = 0; s < S; ++s) {
       const float* row = src + s * v_stride.t;
-      float* packed = dst + s * 8;
+      float* packed = dst + s * 4;
       if (v_stride.d == 1) {
-        ::fused_cpp::sdpa_pack_utils::copy_f32x8(row, packed);
+        packed[0] = row[0];
+        packed[1] = row[1];
+        packed[2] = row[2];
+        packed[3] = row[3];
       } else {
-        for (int64_t i = 0; i < 8; ++i) {
+        for (int64_t i = 0; i < 4; ++i) {
           packed[i] = row[i * v_stride.d];
         }
       }
@@ -264,10 +243,10 @@ void pack_v_to_evblock8_strided(
     int64_t S,
     int64_t Ev,
     ElementStrides v_stride) {
-  const int64_t Eb = Ev / 8;
-  const int64_t dst_stride_b = N * Eb * S * 8;
-  const int64_t dst_stride_n = Eb * S * 8;
-  const int64_t evblock_stride_dst = S * 8;
+  const int64_t Eb = Ev / 4;
+  const int64_t dst_stride_b = N * Eb * S * 4;
+  const int64_t dst_stride_n = Eb * S * 4;
+  const int64_t evblock_stride_dst = S * 4;
 
 #ifdef _OPENMP
   #pragma omp parallel for collapse(3) schedule(static)
@@ -275,7 +254,7 @@ void pack_v_to_evblock8_strided(
   for (int64_t b = 0; b < B; ++b) {
     for (int64_t n = 0; n < N; ++n) {
       for (int64_t eb = 0; eb < Eb; ++eb) {
-        const int64_t ev = eb * 8;
+        const int64_t ev = eb * 4;
         const float* src = v_src + b * v_stride.b
                                  + n * v_stride.n
                                  + ev * v_stride.d;
@@ -284,11 +263,14 @@ void pack_v_to_evblock8_strided(
                            + eb * evblock_stride_dst;
         for (int64_t s = 0; s < S; ++s) {
           const float* row = src + s * v_stride.t;
-          float* packed = dst + s * 8;
+          float* packed = dst + s * 4;
           if (v_stride.d == 1) {
-            ::fused_cpp::sdpa_pack_utils::copy_f32x8(row, packed);
+            packed[0] = row[0];
+            packed[1] = row[1];
+            packed[2] = row[2];
+            packed[3] = row[3];
           } else {
-            for (int64_t i = 0; i < 8; ++i) {
+            for (int64_t i = 0; i < 4; ++i) {
               packed[i] = row[i * v_stride.d];
             }
           }
@@ -342,9 +324,237 @@ inline void qkt_packk8_tail_scalar(
 struct MK_Fp32PackK8PQuad {
   static constexpr const char* kName = "fp32_packk8_pquad";
   static constexpr bool kHasKSBlock8Layout = true;
+  static constexpr bool kHasKSBlock4Layout = true;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
   static constexpr bool kSupportsQktNeonRowMax = true;
 #endif
+
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+  // 4x4 register-blocked GEMM compute (C = A.B). a_i = row i's 4 reduction
+  // values (laneq broadcast); b_j = the j-th reduction value's 4 columns;
+  // c_i = row i's 4-column accumulator.
+  static inline void mm4x4_seed(
+      float32x4_t& c0, float32x4_t& c1, float32x4_t& c2, float32x4_t& c3,
+      float32x4_t a0, float32x4_t a1, float32x4_t a2, float32x4_t a3,
+      float32x4_t b0, float32x4_t b1, float32x4_t b2, float32x4_t b3) {
+    c0 = vmulq_laneq_f32(b0, a0, 0); c1 = vmulq_laneq_f32(b0, a1, 0);
+    c2 = vmulq_laneq_f32(b0, a2, 0); c3 = vmulq_laneq_f32(b0, a3, 0);
+    c0 = vfmaq_laneq_f32(c0, b1, a0, 1); c1 = vfmaq_laneq_f32(c1, b1, a1, 1);
+    c2 = vfmaq_laneq_f32(c2, b1, a2, 1); c3 = vfmaq_laneq_f32(c3, b1, a3, 1);
+    c0 = vfmaq_laneq_f32(c0, b2, a0, 2); c1 = vfmaq_laneq_f32(c1, b2, a1, 2);
+    c2 = vfmaq_laneq_f32(c2, b2, a2, 2); c3 = vfmaq_laneq_f32(c3, b2, a3, 2);
+    c0 = vfmaq_laneq_f32(c0, b3, a0, 3); c1 = vfmaq_laneq_f32(c1, b3, a1, 3);
+    c2 = vfmaq_laneq_f32(c2, b3, a2, 3); c3 = vfmaq_laneq_f32(c3, b3, a3, 3);
+  }
+  static inline void mm4x4_fmla(
+      float32x4_t& c0, float32x4_t& c1, float32x4_t& c2, float32x4_t& c3,
+      float32x4_t a0, float32x4_t a1, float32x4_t a2, float32x4_t a3,
+      float32x4_t b0, float32x4_t b1, float32x4_t b2, float32x4_t b3) {
+    c0 = vfmaq_laneq_f32(c0, b0, a0, 0); c1 = vfmaq_laneq_f32(c1, b0, a1, 0);
+    c2 = vfmaq_laneq_f32(c2, b0, a2, 0); c3 = vfmaq_laneq_f32(c3, b0, a3, 0);
+    c0 = vfmaq_laneq_f32(c0, b1, a0, 1); c1 = vfmaq_laneq_f32(c1, b1, a1, 1);
+    c2 = vfmaq_laneq_f32(c2, b1, a2, 1); c3 = vfmaq_laneq_f32(c3, b1, a3, 1);
+    c0 = vfmaq_laneq_f32(c0, b2, a0, 2); c1 = vfmaq_laneq_f32(c1, b2, a1, 2);
+    c2 = vfmaq_laneq_f32(c2, b2, a2, 2); c3 = vfmaq_laneq_f32(c3, b2, a3, 2);
+    c0 = vfmaq_laneq_f32(c0, b3, a0, 3); c1 = vfmaq_laneq_f32(c1, b3, a1, 3);
+    c2 = vfmaq_laneq_f32(c2, b3, a2, 3); c3 = vfmaq_laneq_f32(c3, b3, a3, 3);
+  }
+#endif
+
+  // Scalar QKT for a partial tile (Lq<4 rows or Sk<4 cols). K is sblock4
+  // (Kp[e*4 + col]); scale already folded into packed K.
+  static inline void qkt_4x4_tail(
+      const float* Q, int64_t q_row_stride,
+      const float* Kp, int64_t,
+      int64_t E, float scale,
+      float* scores_buf, int64_t scores_row_stride,
+      int Lq, int Sk) {
+    (void)scale;
+    for (int i = 0; i < Lq; ++i) {
+      const float* q = Q + i * q_row_stride;
+      float* out = scores_buf + i * scores_row_stride;
+      for (int j = 0; j < Sk; ++j) {
+        float sum = 0.0f;
+        for (int64_t e = 0; e < E; ++e) {
+          sum += q[e] * Kp[e * 4 + j];
+        }
+        out[j] = sum;
+      }
+    }
+  }
+
+  // C[4x4] = Q[4xE] . K^T over E. A=Q rows (laneq over 4 e-values), B=K from
+  // sblock4 (Kp + e*4, 4 cols). 4 A + 4 B + 4 C = 12 vector regs; a second
+  // A/B set (X/Y) double-buffers the load/compute pipeline (load0, load1,
+  // compute0, load2, compute1, ...). C is mul-seeded on the first e-block
+  // (no zero-init), fmla after; scalar tail for E % 4.
+  static inline void qkt_4x4(
+      const float* Q, int64_t q_row_stride,
+      const float* Kp, int64_t,
+      int64_t E, float scale,
+      float* scores_buf, int64_t scores_row_stride) {
+    (void)scale;  // folded into packed K
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+    const float* q0 = Q + 0 * q_row_stride;
+    const float* q1 = Q + 1 * q_row_stride;
+    const float* q2 = Q + 2 * q_row_stride;
+    const float* q3 = Q + 3 * q_row_stride;
+
+    float32x4_t c0, c1, c2, c3;
+    const int64_t nfull = (E / 4) * 4;
+    const int64_t nb = nfull / 4;
+
+    if (nb == 0) {
+      c0 = vdupq_n_f32(0.0f); c1 = vdupq_n_f32(0.0f);
+      c2 = vdupq_n_f32(0.0f); c3 = vdupq_n_f32(0.0f);
+    } else {
+      float32x4_t ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3;
+      float32x4_t ay0, ay1, ay2, ay3, by0, by1, by2, by3;
+#define QKT4_LOAD_X(EE)                                              \
+      do { const int64_t e_ = (EE);                                  \
+        ax0 = vld1q_f32(q0 + e_); ax1 = vld1q_f32(q1 + e_);          \
+        ax2 = vld1q_f32(q2 + e_); ax3 = vld1q_f32(q3 + e_);          \
+        bx0 = vld1q_f32(Kp + e_ * 4 + 0);  bx1 = vld1q_f32(Kp + e_ * 4 + 4);  \
+        bx2 = vld1q_f32(Kp + e_ * 4 + 8);  bx3 = vld1q_f32(Kp + e_ * 4 + 12); \
+      } while (0)
+#define QKT4_LOAD_Y(EE)                                              \
+      do { const int64_t e_ = (EE);                                  \
+        ay0 = vld1q_f32(q0 + e_); ay1 = vld1q_f32(q1 + e_);          \
+        ay2 = vld1q_f32(q2 + e_); ay3 = vld1q_f32(q3 + e_);          \
+        by0 = vld1q_f32(Kp + e_ * 4 + 0);  by1 = vld1q_f32(Kp + e_ * 4 + 4);  \
+        by2 = vld1q_f32(Kp + e_ * 4 + 8);  by3 = vld1q_f32(Kp + e_ * 4 + 12); \
+      } while (0)
+      QKT4_LOAD_X(0);
+      if (nb > 1) QKT4_LOAD_Y(4);
+      mm4x4_seed(c0, c1, c2, c3, ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3);
+      for (int64_t bi = 1; bi < nb; ++bi) {
+        const int64_t e_next = (bi + 1) * 4;
+        if ((bi & 1) == 1) {
+          if (bi + 1 < nb) QKT4_LOAD_X(e_next);
+          mm4x4_fmla(c0, c1, c2, c3, ay0, ay1, ay2, ay3, by0, by1, by2, by3);
+        } else {
+          if (bi + 1 < nb) QKT4_LOAD_Y(e_next);
+          mm4x4_fmla(c0, c1, c2, c3, ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3);
+        }
+      }
+#undef QKT4_LOAD_X
+#undef QKT4_LOAD_Y
+    }
+
+    for (int64_t e = nfull; e < E; ++e) {
+      const float32x4_t kv = vld1q_f32(Kp + e * 4);
+      c0 = vfmaq_n_f32(c0, kv, q0[e]);
+      c1 = vfmaq_n_f32(c1, kv, q1[e]);
+      c2 = vfmaq_n_f32(c2, kv, q2[e]);
+      c3 = vfmaq_n_f32(c3, kv, q3[e]);
+    }
+
+    vst1q_f32(scores_buf + 0 * scores_row_stride, c0);
+    vst1q_f32(scores_buf + 1 * scores_row_stride, c1);
+    vst1q_f32(scores_buf + 2 * scores_row_stride, c2);
+    vst1q_f32(scores_buf + 3 * scores_row_stride, c3);
+#else
+    qkt_4x4_tail(Q, q_row_stride, Kp, 0, E, scale, scores_buf,
+                 scores_row_stride, 4, 4);
+#endif
+  }
+
+  // Scalar PV for a partial tile (Lq<4 rows or Ev<4 cols). Accumulates into O.
+  static inline void pv_4x4_tail(
+      const float* P_hat, int64_t P_row_stride,
+      const float* V, int64_t v_row_stride,
+      int64_t Sk,
+      float* O, int64_t o_row_stride,
+      int Lq, int Ev) {
+    for (int i = 0; i < Lq; ++i) {
+      const float* p = P_hat + i * P_row_stride;
+      float* o = O + i * o_row_stride;
+      for (int j = 0; j < Ev; ++j) {
+        float sum = o[j];
+        for (int64_t k = 0; k < Sk; ++k) {
+          sum += p[k] * V[k * v_row_stride + j];
+        }
+        o[j] = sum;
+      }
+    }
+  }
+
+  // O[4 rows x 4 Ev] += P_hat[4xSk] . V[Skx4] over Sk. A=P rows (laneq over 4
+  // s-values), B=V (V + s*v_row_stride, 4 Ev). Same 12-reg + double-buffer
+  // pipeline as qkt_4x4. C is seeded from O (online-softmax accumulator), so
+  // every block uses fmla; scalar tail for Sk % 4.
+  static inline void pv_4x4(
+      const float* P_hat, int64_t P_row_stride,
+      const float* V, int64_t v_row_stride,
+      int64_t Sk,
+      float* O, int64_t o_row_stride) {
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+    const float* p0 = P_hat + 0 * P_row_stride;
+    const float* p1 = P_hat + 1 * P_row_stride;
+    const float* p2 = P_hat + 2 * P_row_stride;
+    const float* p3 = P_hat + 3 * P_row_stride;
+
+    float32x4_t c0 = vld1q_f32(O + 0 * o_row_stride);
+    float32x4_t c1 = vld1q_f32(O + 1 * o_row_stride);
+    float32x4_t c2 = vld1q_f32(O + 2 * o_row_stride);
+    float32x4_t c3 = vld1q_f32(O + 3 * o_row_stride);
+
+    const int64_t nfull = (Sk / 4) * 4;
+    const int64_t nb = nfull / 4;
+    if (nb > 0) {
+      float32x4_t ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3;
+      float32x4_t ay0, ay1, ay2, ay3, by0, by1, by2, by3;
+#define PV4_LOAD_X(SS)                                              \
+      do { const int64_t s_ = (SS);                                 \
+        ax0 = vld1q_f32(p0 + s_); ax1 = vld1q_f32(p1 + s_);         \
+        ax2 = vld1q_f32(p2 + s_); ax3 = vld1q_f32(p3 + s_);         \
+        bx0 = vld1q_f32(V + (s_ + 0) * v_row_stride);               \
+        bx1 = vld1q_f32(V + (s_ + 1) * v_row_stride);               \
+        bx2 = vld1q_f32(V + (s_ + 2) * v_row_stride);               \
+        bx3 = vld1q_f32(V + (s_ + 3) * v_row_stride);               \
+      } while (0)
+#define PV4_LOAD_Y(SS)                                              \
+      do { const int64_t s_ = (SS);                                 \
+        ay0 = vld1q_f32(p0 + s_); ay1 = vld1q_f32(p1 + s_);         \
+        ay2 = vld1q_f32(p2 + s_); ay3 = vld1q_f32(p3 + s_);         \
+        by0 = vld1q_f32(V + (s_ + 0) * v_row_stride);               \
+        by1 = vld1q_f32(V + (s_ + 1) * v_row_stride);               \
+        by2 = vld1q_f32(V + (s_ + 2) * v_row_stride);               \
+        by3 = vld1q_f32(V + (s_ + 3) * v_row_stride);               \
+      } while (0)
+      PV4_LOAD_X(0);
+      if (nb > 1) PV4_LOAD_Y(4);
+      mm4x4_fmla(c0, c1, c2, c3, ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3);
+      for (int64_t bi = 1; bi < nb; ++bi) {
+        const int64_t s_next = (bi + 1) * 4;
+        if ((bi & 1) == 1) {
+          if (bi + 1 < nb) PV4_LOAD_X(s_next);
+          mm4x4_fmla(c0, c1, c2, c3, ay0, ay1, ay2, ay3, by0, by1, by2, by3);
+        } else {
+          if (bi + 1 < nb) PV4_LOAD_Y(s_next);
+          mm4x4_fmla(c0, c1, c2, c3, ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3);
+        }
+      }
+#undef PV4_LOAD_X
+#undef PV4_LOAD_Y
+    }
+
+    for (int64_t s = nfull; s < Sk; ++s) {
+      const float32x4_t vv = vld1q_f32(V + s * v_row_stride);
+      c0 = vfmaq_n_f32(c0, vv, p0[s]);
+      c1 = vfmaq_n_f32(c1, vv, p1[s]);
+      c2 = vfmaq_n_f32(c2, vv, p2[s]);
+      c3 = vfmaq_n_f32(c3, vv, p3[s]);
+    }
+
+    vst1q_f32(O + 0 * o_row_stride, c0);
+    vst1q_f32(O + 1 * o_row_stride, c1);
+    vst1q_f32(O + 2 * o_row_stride, c2);
+    vst1q_f32(O + 3 * o_row_stride, c3);
+#else
+    pv_4x4_tail(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride, 4, 4);
+#endif
+  }
 
   static inline void qkt_8x8(
       const float* Q, int64_t q_row_stride,
@@ -1259,16 +1469,16 @@ void run_fp32_packk_path(
     int total_threads,
     ElementStrides q_stride,
     ElementStrides out_stride) {
-  const int64_t S_blocks = ceil_div8_i64(p.S);
-  const int64_t k_packed_stride_n = S_blocks * p.E * 8;
+  const int64_t S_blocks = ceil_div4_i64(p.S);
+  const int64_t k_packed_stride_n = S_blocks * p.E * 4;
   const int64_t k_packed_stride_b = p.N * k_packed_stride_n;
   const int64_t k_packed_stride_s = p.E;
 
-  const int64_t Eb = p.Ev / 8;
-  const int64_t v_evblock_stride = p.S * 8;
+  const int64_t Eb = p.Ev / 4;
+  const int64_t v_evblock_stride = p.S * 4;
   const int64_t v_packed_stride_n = Eb * v_evblock_stride;
   const int64_t v_packed_stride_b = p.N * v_packed_stride_n;
-  const int64_t v_packed_stride_s = 8;
+  const int64_t v_packed_stride_s = 4;
 
   const int64_t m_stride_b = p.N * p.L * p.S;
   const int64_t m_stride_n = p.L * p.S;
@@ -1310,8 +1520,8 @@ void run_fp32_packk_path_per_head(
     ElementStrides k_stride,
     ElementStrides v_stride,
     ElementStrides out_stride) {
-  const int64_t S_blocks = ceil_div8_i64(p.S);
-  const int64_t Eb = p.Ev / 8;
+  const int64_t S_blocks = ceil_div4_i64(p.S);
+  const int64_t Eb = p.Ev / 4;
 
   // Reused across calls (grow-only): the pack functions below overwrite every
   // element they read (including zero-padded tails), so stale contents are
@@ -1320,13 +1530,13 @@ void run_fp32_packk_path_per_head(
   static thread_local AlignedVector<float> v_packed;
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVAlloc);
-    v_packed.resize(static_cast<size_t>(Eb * p.S * 8));
+    v_packed.resize(static_cast<size_t>(Eb * p.S * 4));
   }
 
   static thread_local AlignedVector<float> k_packed;
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKAlloc);
-    k_packed.resize(static_cast<size_t>(S_blocks * p.E * 8));
+    k_packed.resize(static_cast<size_t>(S_blocks * p.E * 4));
   }
 
   for (int64_t b = 0; b < p.B; ++b) {
@@ -1337,12 +1547,12 @@ void run_fp32_packk_path_per_head(
 
       {
         FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVPack);
-        pack_v_to_evblock8_one_head_strided(
+        pack_v_to_evblock4_one_head_strided(
             v_head, v_packed.data(), p.S, p.Ev, v_stride);
       }
       {
         FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
-        pack_k_fp32_to_sblock8_one_head_strided(
+        pack_k_fp32_to_sblock4_one_head_strided(
             k_head, k_packed.data(), p.S, p.E, k_stride, p.scale_f);
       }
 
@@ -1594,11 +1804,11 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
       }
     }
   } else {
-    const int64_t eb = cfg.Ev / 8;
+    const int64_t eb = cfg.Ev / 4;
     AlignedVector<float> v_packed;
     {
       FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVAlloc);
-      v_packed.resize(static_cast<size_t>(cfg.B * cfg.N * eb * cfg.S * 8));
+      v_packed.resize(static_cast<size_t>(cfg.B * cfg.N * eb * cfg.S * 4));
     }
     {
       FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVPack);
@@ -1610,7 +1820,7 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
     {
       FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKAlloc);
       k_packed.resize(static_cast<size_t>(
-          cfg.B * cfg.N * ceil_div8_i64(cfg.S) * cfg.E * 8));
+          cfg.B * cfg.N * ceil_div4_i64(cfg.S) * cfg.E * 4));
     }
     {
       FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);

@@ -298,9 +298,9 @@ inline TileSizes compute_tile_sizes(
   (void)B;
   (void)N;
 
-  constexpr int64_t Sk_micro = 8;
-  constexpr int64_t Lq_micro = 8;
-  constexpr int64_t Ev_micro = 8;
+  constexpr int64_t Sk_micro = 4;
+  constexpr int64_t Lq_micro = 4;
+  constexpr int64_t Ev_micro = 4;
 
   const auto& cache_bytes = effective_cache_bytes();
   const int64_t l3_budget =
@@ -435,17 +435,17 @@ inline TileSizes compute_tile_sizes_l3kv(
   }
 
   int64_t Lc_cap = f_l2 / per_row_bytes;
-  // 8 倍数且夹紧到 [8, 64]。
-  Lc_cap = (Lc_cap / 8) * 8;
-  if (Lc_cap < 8) Lc_cap = 8;
+  // 4 倍数且夹紧到 [4, 64]。
+  Lc_cap = (Lc_cap / 4) * 4;
+  if (Lc_cap < 4) Lc_cap = 4;
   if (Lc_cap > 64) Lc_cap = 64;
 
-  // 不超过 L 自身的 8 倍数对齐。
-  int64_t Lc_by_L = floor_to_mult_min(L, 8);
+  // 不超过 L 自身的 4 倍数对齐。
+  int64_t Lc_by_L = floor_to_mult_min(L, 4);
 
   int64_t Lc_new = std::min<int64_t>(Lc_cap, Lc_by_L);
-  // 至少 8（micro-kernel 步长）。
-  if (Lc_new < 8) Lc_new = 8;
+  // 至少 4（micro-kernel 步长）。
+  if (Lc_new < 4) Lc_new = 4;
 
   ts.Lc_l2 = Lc_new;
 

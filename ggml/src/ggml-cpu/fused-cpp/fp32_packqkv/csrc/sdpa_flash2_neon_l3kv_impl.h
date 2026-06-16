@@ -139,14 +139,28 @@ template <class MK, typename scalar_t>
 inline constexpr bool has_k_sblock8_layout_v =
     has_k_sblock8_layout<MK, scalar_t>::value;
 
+template <class MK, typename scalar_t, class = void>
+struct has_k_sblock4_layout : std::false_type {};
+
+template <class MK, typename scalar_t>
+struct has_k_sblock4_layout<
+    MK,
+    scalar_t,
+    std::void_t<decltype(MK::kHasKSBlock4Layout)>>
+    : std::bool_constant<MK::kHasKSBlock4Layout> {};
+
+template <class MK, typename scalar_t>
+inline constexpr bool has_k_sblock4_layout_v =
+    has_k_sblock4_layout<MK, scalar_t>::value;
+
 template <class MK, typename scalar_t>
 inline const scalar_t* k_tile_ptr_impl(
     const scalar_t* k_base,
     int64_t s_global,
     int64_t k_stride_s,
     int64_t E) {
-  if constexpr (has_k_sblock8_layout_v<MK, scalar_t>) {
-    return k_base + (s_global / 8) * E * 8 + (s_global & 7);
+  if constexpr (has_k_sblock4_layout_v<MK, scalar_t>) {
+    return k_base + (s_global / 4) * E * 4 + (s_global & 3);
   } else {
     return k_base + s_global * k_stride_s;
   }
@@ -907,7 +921,7 @@ inline void process_q_tile_lc(
     }
   }
 
-  const int64_t LQ_INNER = 8;
+  const int64_t LQ_INNER = 4;
   const int64_t num_inner = ceil_div_pos(Lc_eff, LQ_INNER);
   const int64_t Sc_l2 = ts.Sc_l2;
   (void)Sc_l2;
@@ -979,10 +993,8 @@ inline void process_q_tile_lc(
 
         const scalar_t* Qrow_inner = Qrow0 + qi_inner * LQ_INNER * q_stride_l;
         int64_t Sc_active = Sc_cur;
-        float fused_row_max[8];
-        for (int i = 0; i < 8; ++i) fused_row_max[i] = p.neg_inf;
-        int64_t softmax_len[8];
-        for (int i = 0; i < 8; ++i) softmax_len[i] = Sc_cur;
+        int64_t softmax_len[4];
+        for (int i = 0; i < 4; ++i) softmax_len[i] = Sc_cur;
         if constexpr (kCausal) {
           const int64_t q_inner_max_causal =
               causal_lim[qi_inner * LQ_INNER + Lq_eff - 1];
@@ -996,21 +1008,10 @@ inline void process_q_tile_lc(
             softmax_len[i] = std::max<int64_t>(
                 0, std::min<int64_t>(Sc_active, lim - s_l2 + 1));
           }
-          for (int i = Lq_eff; i < 8; ++i) {
+          for (int i = Lq_eff; i < 4; ++i) {
             softmax_len[i] = 0;
           }
         }
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
-        float32x4_t fused_row_max_lo[8];
-        float32x4_t fused_row_max_hi[8];
-        if constexpr (!kCausal) {
-          const float32x4_t vneg = vdupq_n_f32(p.neg_inf);
-          for (int i = 0; i < 8; ++i) {
-            fused_row_max_lo[i] = vneg;
-            fused_row_max_hi[i] = vneg;
-          }
-        }
-#endif
 
         if (qi_inner + 2 < num_inner) {
           for (int line = 0; line < 2; ++line) {
@@ -1026,160 +1027,12 @@ inline void process_q_tile_lc(
             has_direct_mask && Sc_cur <= kMaxTrackedPvSkip;
         bool pv_skip_initialized = false;
         bool has_pv_skip = false;
-        const bool precompute_row_max =
-            !kCausal && use_qkt_rowmax_fusion_impl();
-        const bool qkt_updates_row_max =
-            precompute_row_max && (!kHasMask || has_direct_mask);
-        auto update_qkt_row_max =
-            [&](int l_count, int64_t s_start, int s_count) {
-              if (!qkt_updates_row_max) {
-                return;
-              }
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
-              update_row_max_block_neon_impl(
-                  fused_row_max_lo, fused_row_max_hi, fused_row_max,
-                  scores_8 + s_start, Sc_cur, l_count, s_count);
-#else
-              update_row_max_block_impl(
-                  fused_row_max, scores_8 + s_start,
-                  Sc_cur, l_count, s_count);
-#endif
-            };
 
         {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
           // ── 步骤 1: scores[Lq_eff][Sc_cur] = scale * Q · K^T ──
           int64_t s_off = 0;
-          if constexpr (
-              has_qkt_4x32_v<MK, scalar_t> &&
-              has_k_sblock8_layout_v<MK, scalar_t>) {
-            if (use_sve_qkt_4x32_experiment_impl()) {
-              for (;
-                   Lq_eff == 8 && ((s_l2 + s_off) & 7) == 0 &&
-                   s_off + 32 <= Sc_active;
-                   s_off += 32) {
-                const scalar_t* K_tile =
-                    k_tile_ptr_impl<MK, scalar_t>(
-                        Kbase, s_l2 + s_off, k_stride_s, p.E);
-                MaskBlockKind mask_kind = MaskBlockKind::kMixed;
-                if constexpr (kHasMask) {
-                  if (has_direct_mask) {
-                    mask_kind = classify_direct_mask_block_impl(
-                        p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 32);
-                  }
-                }
-                if (mask_kind == MaskBlockKind::kAllOff) {
-                  fill_scores_block_impl(
-                      scores_8 + s_off, Sc_cur, 8, 32, p.neg_inf);
-                  if (track_pv_skip) {
-                    mark_pv_skip_block_impl(
-                        pv_skip_s, pv_skip_initialized, has_pv_skip,
-                        Sc_cur, s_off, 32);
-                  }
-                } else {
-                  MK::qkt_4x32(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                               p.E, p.scale_f,
-                               scores_8 + s_off, Sc_cur);
-                  MK::qkt_4x32(Qrow_inner + 4 * q_stride_l, q_stride_l,
-                               K_tile, k_stride_s,
-                               p.E, p.scale_f,
-                               scores_8 + 4 * Sc_cur + s_off, Sc_cur);
-                }
-                if constexpr (kHasMask) {
-                  if (has_direct_mask &&
-                      mask_kind == MaskBlockKind::kMixed) {
-                    add_direct_mask_to_scores_block_impl(
-                        p, b, n, q0_inner, s_l2 + s_off, 8, 32,
-                        scores_8 + s_off, Sc_cur);
-                  }
-                }
-                if (mask_kind != MaskBlockKind::kAllOff) {
-                  update_qkt_row_max(8, s_off, 32);
-                }
-              }
-            }
-          }
-          for (; s_off + 8 <= Sc_active; s_off += 8) {
-            const scalar_t* K_tile =
-                k_tile_ptr_impl<MK, scalar_t>(
-                    Kbase, s_l2 + s_off, k_stride_s, p.E);
-            MaskBlockKind mask_kind = MaskBlockKind::kMixed;
-            if constexpr (kHasMask) {
-              if (has_direct_mask) {
-                mask_kind = classify_direct_mask_block_impl(
-                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 8);
-              }
-            }
-            if (Lq_eff == 8) {
-              bool rowmax_in_qkt = false;
-              if (mask_kind == MaskBlockKind::kAllOff) {
-                fill_scores_block_impl(
-                    scores_8 + s_off, Sc_cur, 8, 8, p.neg_inf);
-                if (track_pv_skip) {
-                  mark_pv_skip_block_impl(
-                      pv_skip_s, pv_skip_initialized, has_pv_skip,
-                      Sc_cur, s_off, 8);
-                }
-              } else {
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
-                if constexpr (has_qkt_neon_rowmax_v<MK>) {
-                  if (qkt_updates_row_max &&
-                      (!kHasMask || mask_kind == MaskBlockKind::kAllZero)) {
-                    MK::qkt_8x8_rowmax(
-                        Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                        p.E, p.scale_f,
-                        scores_8 + s_off, Sc_cur,
-                        fused_row_max_lo, fused_row_max_hi);
-                    rowmax_in_qkt = true;
-                  }
-                }
-#endif
-                if (!rowmax_in_qkt) {
-                  MK::qkt_8x8(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                              p.E, p.scale_f,
-                              scores_8 + s_off, Sc_cur);
-                }
-              }
-              if constexpr (kHasMask) {
-                if (has_direct_mask &&
-                    mask_kind == MaskBlockKind::kMixed) {
-                  add_direct_mask_to_scores_block_impl(
-                      p, b, n, q0_inner, s_l2 + s_off, 8, 8,
-                      scores_8 + s_off, Sc_cur);
-                }
-              }
-              if (mask_kind != MaskBlockKind::kAllOff && !rowmax_in_qkt) {
-                update_qkt_row_max(8, s_off, 8);
-              }
-            } else {
-              if (mask_kind == MaskBlockKind::kAllOff) {
-                fill_scores_block_impl(
-                    scores_8 + s_off, Sc_cur, Lq_eff, 8, p.neg_inf);
-                if (track_pv_skip) {
-                  mark_pv_skip_block_impl(
-                      pv_skip_s, pv_skip_initialized, has_pv_skip,
-                      Sc_cur, s_off, 8);
-                }
-              } else {
-                MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                             p.E, p.scale_f,
-                             scores_8 + s_off, Sc_cur,
-                             Lq_eff, 8);
-              }
-              if constexpr (kHasMask) {
-                if (has_direct_mask &&
-                    mask_kind == MaskBlockKind::kMixed) {
-                  add_direct_mask_to_scores_block_impl(
-                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 8,
-                      scores_8 + s_off, Sc_cur);
-                }
-              }
-              if (mask_kind != MaskBlockKind::kAllOff) {
-                update_qkt_row_max(Lq_eff, s_off, 8);
-              }
-            }
-          }
-          if (s_off + 4 <= Sc_active) {
+          for (; s_off + 4 <= Sc_active; s_off += 4) {
             const scalar_t* K_tile =
                 k_tile_ptr_impl<MK, scalar_t>(
                     Kbase, s_l2 + s_off, k_stride_s, p.E);
@@ -1190,75 +1043,31 @@ inline void process_q_tile_lc(
                     p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4);
               }
             }
-            if (Lq_eff == 8) {
-              bool rowmax_in_qkt = false;
-              if (mask_kind == MaskBlockKind::kAllOff) {
-                fill_scores_block_impl(
-                    scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
-                if (track_pv_skip) {
-                  mark_pv_skip_block_impl(
-                      pv_skip_s, pv_skip_initialized, has_pv_skip,
-                      Sc_cur, s_off, 4);
-                }
-              } else {
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
-                if constexpr (has_qkt_neon_rowmax_v<MK>) {
-                  if (qkt_updates_row_max &&
-                      (!kHasMask || mask_kind == MaskBlockKind::kAllZero)) {
-                    MK::qkt_8x4_rowmax(
-                        Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                        p.E, p.scale_f,
-                        scores_8 + s_off, Sc_cur,
-                        fused_row_max_lo);
-                    rowmax_in_qkt = true;
-                  }
-                }
-#endif
-                if (!rowmax_in_qkt) {
-                  MK::qkt_8x4(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                              p.E, p.scale_f,
-                              scores_8 + s_off, Sc_cur);
-                }
+            if (mask_kind == MaskBlockKind::kAllOff) {
+              fill_scores_block_impl(
+                  scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
+              if (track_pv_skip) {
+                mark_pv_skip_block_impl(
+                    pv_skip_s, pv_skip_initialized, has_pv_skip,
+                    Sc_cur, s_off, 4);
               }
-              if constexpr (kHasMask) {
-                if (has_direct_mask &&
-                    mask_kind == MaskBlockKind::kMixed) {
-                  add_direct_mask_to_scores_block_impl(
-                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4,
-                      scores_8 + s_off, Sc_cur);
-                }
-              }
-              if (mask_kind != MaskBlockKind::kAllOff && !rowmax_in_qkt) {
-                update_qkt_row_max(Lq_eff, s_off, 4);
-              }
+            } else if (Lq_eff == 4) {
+              MK::qkt_4x4(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                          p.E, p.scale_f,
+                          scores_8 + s_off, Sc_cur);
             } else {
-              if (mask_kind == MaskBlockKind::kAllOff) {
-                fill_scores_block_impl(
-                    scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
-                if (track_pv_skip) {
-                  mark_pv_skip_block_impl(
-                      pv_skip_s, pv_skip_initialized, has_pv_skip,
-                      Sc_cur, s_off, 4);
-                }
-              } else {
-                MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                             p.E, p.scale_f,
-                             scores_8 + s_off, Sc_cur,
-                             Lq_eff, 4);
-              }
-              if constexpr (kHasMask) {
-                if (has_direct_mask &&
-                    mask_kind == MaskBlockKind::kMixed) {
-                  add_direct_mask_to_scores_block_impl(
-                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4,
-                      scores_8 + s_off, Sc_cur);
-                }
-              }
-              if (mask_kind != MaskBlockKind::kAllOff) {
-                update_qkt_row_max(Lq_eff, s_off, 4);
+              MK::qkt_4x4_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                               p.E, p.scale_f,
+                               scores_8 + s_off, Sc_cur,
+                               Lq_eff, 4);
+            }
+            if constexpr (kHasMask) {
+              if (has_direct_mask && mask_kind == MaskBlockKind::kMixed) {
+                add_direct_mask_to_scores_block_impl(
+                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4,
+                    scores_8 + s_off, Sc_cur);
               }
             }
-            s_off += 4;
           }
           if (s_off < Sc_active) {
             const scalar_t* K_tile =
@@ -1281,22 +1090,17 @@ inline void process_q_tile_lc(
                     Sc_cur, s_off, tail_width);
               }
             } else {
-              MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                           p.E, p.scale_f,
-                           scores_8 + s_off, Sc_cur,
-                           Lq_eff, tail_width);
+              MK::qkt_4x4_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                               p.E, p.scale_f,
+                               scores_8 + s_off, Sc_cur,
+                               Lq_eff, tail_width);
             }
             if constexpr (kHasMask) {
-              if (has_direct_mask &&
-                  mask_kind == MaskBlockKind::kMixed) {
+              if (has_direct_mask && mask_kind == MaskBlockKind::kMixed) {
                 add_direct_mask_to_scores_block_impl(
-                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff,
-                    tail_width,
+                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, tail_width,
                     scores_8 + s_off, Sc_cur);
               }
-            }
-            if (mask_kind != MaskBlockKind::kAllOff) {
-              update_qkt_row_max(Lq_eff, s_off, tail_width);
             }
             s_off = Sc_active;
           }
@@ -1318,143 +1122,57 @@ inline void process_q_tile_lc(
                                               + s_l2;
               float* sc_row = scores_8 + i * Sc_cur;
               int64_t j = 0;
-              if (!precompute_row_max) {
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-                for (; j + 8 <= Sc_active; j += 8) {
-                  const float32x4_t v0 =
-                      vaddq_f32(vld1q_f32(sc_row + j),
-                                vld1q_f32(m_row + j));
-                  const float32x4_t v1 =
-                      vaddq_f32(vld1q_f32(sc_row + j + 4),
-                                vld1q_f32(m_row + j + 4));
-                  vst1q_f32(sc_row + j, v0);
-                  vst1q_f32(sc_row + j + 4, v1);
-                }
-                for (; j + 4 <= Sc_active; j += 4) {
-                  const float32x4_t v =
-                      vaddq_f32(vld1q_f32(sc_row + j),
-                                vld1q_f32(m_row + j));
-                  vst1q_f32(sc_row + j, v);
-                }
-#endif
-                for (; j < Sc_active; ++j) {
-                  sc_row[j] += m_row[j];
-                }
-                continue;
-              }
-
-              float m = p.neg_inf;
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
-              float32x4_t vm = vdupq_n_f32(p.neg_inf);
-              float32x4_t vm1 = vdupq_n_f32(p.neg_inf);
-              for (; j + 8 <= Sc_active; j += 8) {
-                const float32x4_t v0 =
-                    vaddq_f32(vld1q_f32(sc_row + j),
-                              vld1q_f32(m_row + j));
-                const float32x4_t v1 =
-                    vaddq_f32(vld1q_f32(sc_row + j + 4),
-                              vld1q_f32(m_row + j + 4));
-                vst1q_f32(sc_row + j, v0);
-                vst1q_f32(sc_row + j + 4, v1);
-                vm = vmaxq_f32(vm, v0);
-                vm1 = vmaxq_f32(vm1, v1);
-              }
               for (; j + 4 <= Sc_active; j += 4) {
                 const float32x4_t v =
-                    vaddq_f32(vld1q_f32(sc_row + j),
-                              vld1q_f32(m_row + j));
+                    vaddq_f32(vld1q_f32(sc_row + j), vld1q_f32(m_row + j));
                 vst1q_f32(sc_row + j, v);
-                vm = vmaxq_f32(vm, v);
               }
-              m = vmaxvq_f32(vmaxq_f32(vm, vm1));
 #endif
               for (; j < Sc_active; ++j) {
                 sc_row[j] += m_row[j];
-                if (sc_row[j] > m) m = sc_row[j];
               }
-              fused_row_max[i] = m;
             }
           }
         }
 
         // ── 步骤 3: causal mask（按 row；kCausal 编译期开关）──
         if constexpr (kCausal) {
-          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMask);
           // Row-specific causal visibility is represented by softmax_len.
           // QK only computed the prefix shared by at least one row in this
-          // 8-row Q block; invalid row tails are zeroed in P before PV.
+          // 4-row Q block; invalid row tails are zeroed in P before PV.
         }
 
-        float new_max[8];
+        float new_max[4];
         {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kSoftmax);
-          // ── 步骤 4–7: 逐行 online softmax ──
-          // Optional QKT row-max fusion is kept behind an env gate because it
-          // trades score reloads for extra QKT store-path vmax instructions.
-          float row_max[8];
-          for (int i = 0; i < 8; ++i) row_max[i] = p.neg_inf;
-          if constexpr (!kCausal) {
-            if (precompute_row_max) {
-              for (int i = 0; i < Lq_eff; ++i) {
-                row_max[i] = fused_row_max[i];
-              }
+          // ── 步骤 4–7: 逐行 online softmax（plain：扫 scores 求 row max）──
+          float row_max[4];
+          for (int i = 0; i < 4; ++i) row_max[i] = p.neg_inf;
+          for (int i = 0; i < Lq_eff; ++i) {
+            const float* sc_row = scores_8 + i * Sc_cur;
+            float m = p.neg_inf;
+            const int64_t len_i = softmax_len[i];
+            int64_t j = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-              for (int i = 0; i < Lq_eff; ++i) {
-                const float32x4_t vmax =
-                    vmaxq_f32(fused_row_max_lo[i], fused_row_max_hi[i]);
-                row_max[i] = std::max(row_max[i], vmaxvq_f32(vmax));
-              }
-#endif
-            } else {
-              for (int i = 0; i < Lq_eff; ++i) {
-                const float* sc_row = scores_8 + i * Sc_cur;
-                float m = p.neg_inf;
-                const int64_t len_i = softmax_len[i];
-                int64_t j = 0;
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
-                float32x4_t vm = vdupq_n_f32(p.neg_inf);
-                float32x4_t vm1 = vdupq_n_f32(p.neg_inf);
-                for (; j + 8 <= len_i; j += 8) {
-                  vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
-                  vm1 = vmaxq_f32(vm1, vld1q_f32(sc_row + j + 4));
-                }
-                for (; j + 4 <= len_i; j += 4) {
-                  vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
-                }
-                m = vmaxvq_f32(vmaxq_f32(vm, vm1));
-#endif
-                for (; j < len_i; ++j) {
-                  if (sc_row[j] > m) m = sc_row[j];
-                }
-                row_max[i] = m;
-              }
+            float32x4_t vm = vdupq_n_f32(p.neg_inf);
+            float32x4_t vm1 = vdupq_n_f32(p.neg_inf);
+            for (; j + 8 <= len_i; j += 8) {
+              vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
+              vm1 = vmaxq_f32(vm1, vld1q_f32(sc_row + j + 4));
             }
-          } else {
-            for (int i = 0; i < Lq_eff; ++i) {
-              const float* sc_row = scores_8 + i * Sc_cur;
-              float m = p.neg_inf;
-              const int64_t len_i = softmax_len[i];
-              int64_t j = 0;
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
-              float32x4_t vm = vdupq_n_f32(p.neg_inf);
-              float32x4_t vm1 = vdupq_n_f32(p.neg_inf);
-              for (; j + 8 <= len_i; j += 8) {
-                vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
-                vm1 = vmaxq_f32(vm1, vld1q_f32(sc_row + j + 4));
-              }
-              for (; j + 4 <= len_i; j += 4) {
-                vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
-              }
-              m = vmaxvq_f32(vmaxq_f32(vm, vm1));
-#endif
-              for (; j < len_i; ++j) {
-                if (sc_row[j] > m) m = sc_row[j];
-              }
-              row_max[i] = m;
+            for (; j + 4 <= len_i; j += 4) {
+              vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
             }
+            m = vmaxvq_f32(vmaxq_f32(vm, vm1));
+#endif
+            for (; j < len_i; ++j) {
+              if (sc_row[j] > m) m = sc_row[j];
+            }
+            row_max[i] = m;
           }
 
-          float correction[8];
+          float correction[4];
           for (int i = 0; i < Lq_eff; ++i) {
             if (rmax_8[i] == p.neg_inf) {
               new_max[i] = row_max[i];
@@ -1486,15 +1204,8 @@ inline void process_q_tile_lc(
             }
             rsum_8[i] += row_sum;
           }
-          for (int i = Lq_eff; i < 8; ++i) {
+          for (int i = Lq_eff; i < 4; ++i) {
             std::memset(p_hat_8 + i * Sc_cur, 0, sizeof(float) * Sc_cur);
-          }
-        }
-        if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
-          FUSED_CPP_SDPA_PROFILE_SCOPE(
-              ::fused_cpp::sdpa_profile::Slot::kPConvert);
-          for (int64_t idx = 0; idx < 8 * Sc_cur; ++idx) {
-            p_hat_bf16_8[idx] = static_cast<at::BFloat16>(p_hat_8[idx]);
           }
         }
 
@@ -1512,20 +1223,15 @@ inline void process_q_tile_lc(
         // 数值上完全等价：fma 累加序按 k 单调递增，未变。
         {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
-          constexpr int64_t kPvEvStep = has_pv_8x16_v<MK, scalar_t> ? 16 : 8;
+          constexpr int64_t kPvEvStep = 4;
           for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += kPvEvStep) {
-            // ── packv 路径下的 V cold prefetch ──
-            // 非 packed 路径上 ev_off += 8 只是行内偏移（同一 cache line 后半），
-            // HW prefetcher 已经覆盖。但 packv layout 下 ev_off += 8 = 跳到
-            // 下一个 ev_block，物理地址跨 S*32 字节（典型 S=2048 fp32 时
-            // 64KiB），远超 stride prefetcher 跟踪窗口（A-class typical
-            // ≤4KiB stride）。在每次 ev_off 切换时把下一个 ev_block 起始的
-            // 2 cache line 提前进 L1，覆盖 ~80–200 cycle 的 LLC→L1 延迟，
-            // 与 PV inner 循环并行。
+            // packv layout 下 ev_off += 4 跳到下一个 ev_block（物理地址跨
+            // S*16 字节），远超 stride prefetcher 跟踪窗口；切块时把下一个
+            // ev_block 起始 2 cache line 提前进 L1，与 PV inner 循环并行。
             if constexpr (kPackedV) {
               if (ev_off + kPvEvStep < p.Ev) {
                 const scalar_t* next_block =
-                    Vbase + ((ev_off + kPvEvStep) >> 3) * v_evblock_stride;
+                    Vbase + ((ev_off + kPvEvStep) >> 2) * v_evblock_stride;
                 for (int line = 0; line < 2; ++line) {
                   prefetch_l1_keep_impl(
                       reinterpret_cast<const char*>(next_block) + line * 64);
@@ -1536,24 +1242,12 @@ inline void process_q_tile_lc(
             const int64_t Ev_cur = std::min<int64_t>(kPvEvStep, p.Ev - ev_off);
 
             const scalar_t* V_tile;
-            const scalar_t* V_tile_hi = nullptr;
             int64_t v_row_stride_for_mk;
             if constexpr (kPackedV) {
-              V_tile = Vbase + (ev_off >> 3) * v_evblock_stride;  // k=0 起点
-              if constexpr (has_pv_8x16_v<MK, scalar_t>) {
-                if (Ev_cur >= 16) {
-                  V_tile_hi =
-                      Vbase + ((ev_off >> 3) + 1) * v_evblock_stride;
-                }
-              }
-              v_row_stride_for_mk = 8;
+              V_tile = Vbase + (ev_off >> 2) * v_evblock_stride;  // k=0 起点
+              v_row_stride_for_mk = 4;
             } else {
-              V_tile = Vbase + ev_off;                             // k=0 起点
-              if constexpr (has_pv_8x16_v<MK, scalar_t>) {
-                if (Ev_cur >= 16) {
-                  V_tile_hi = V_tile + 8;
-                }
-              }
+              V_tile = Vbase + ev_off;                            // k=0 起点
               v_row_stride_for_mk = v_stride_s;
             }
             float* O_tile = o_acc_8 + ev_off;
@@ -1563,50 +1257,17 @@ inline void process_q_tile_lc(
                 return;
               }
               const scalar_t* V_seg = V_tile + k_start * v_row_stride_for_mk;
-              if constexpr (has_pv_8x16_v<MK, scalar_t>) {
-                if (Lq_eff == 8 && Ev_cur == 16) {
-                  const scalar_t* V_seg_hi =
-                      V_tile_hi + k_start * v_row_stride_for_mk;
-                  MK::pv_8x16(p_hat_8 + k_start, Sc_cur,
-                              V_seg, V_seg_hi, v_row_stride_for_mk,
-                              k_len,
-                              O_tile, p.Ev);
-                  return;
-                }
-                if (Ev_cur == 16) {
-                  const scalar_t* V_seg_hi =
-                      V_tile_hi + k_start * v_row_stride_for_mk;
-                  MK::pv_tail(p_hat_8 + k_start, Sc_cur,
-                              V_seg, v_row_stride_for_mk,
-                              k_len,
-                              O_tile, p.Ev,
-                              Lq_eff, 8);
-                  MK::pv_tail(p_hat_8 + k_start, Sc_cur,
-                              V_seg_hi, v_row_stride_for_mk,
-                              k_len,
-                              O_tile + 8, p.Ev,
-                              Lq_eff, 8);
-                  return;
-                }
-              }
-              if (Lq_eff == 8 && Ev_cur == 8) {
-                if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
-                  MK::pv_8x8_pbf16(p_hat_bf16_8 + k_start, Sc_cur,
-                                    V_seg, v_row_stride_for_mk,
-                                    k_len,
-                                    O_tile, p.Ev);
-                } else {
-                  MK::pv_8x8(p_hat_8 + k_start, Sc_cur,
-                             V_seg, v_row_stride_for_mk,
-                             k_len,
-                             O_tile, p.Ev);
-                }
+              if (Lq_eff == 4 && Ev_cur == 4) {
+                MK::pv_4x4(p_hat_8 + k_start, Sc_cur,
+                           V_seg, v_row_stride_for_mk,
+                           k_len,
+                           O_tile, p.Ev);
               } else {
-                MK::pv_tail(p_hat_8 + k_start, Sc_cur,
-                            V_seg, v_row_stride_for_mk,
-                            k_len,
-                            O_tile, p.Ev,
-                            Lq_eff, static_cast<int>(Ev_cur));
+                MK::pv_4x4_tail(p_hat_8 + k_start, Sc_cur,
+                                V_seg, v_row_stride_for_mk,
+                                k_len,
+                                O_tile, p.Ev,
+                                Lq_eff, static_cast<int>(Ev_cur));
               }
             };
 

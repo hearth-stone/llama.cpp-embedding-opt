@@ -80,6 +80,14 @@ bool use_sve_microkernels() {
   return enabled;
 }
 
+// Runtime switch between the official qkt_8x8 (default) and the experimental
+// test kernel. FUSED_CPP_SDPA_QKT_TEST=1 selects the test version for A/B
+// perf comparison in a single binary.
+bool use_qkt_8x8_test() {
+  static const bool enabled = env_flag_enabled("FUSED_CPP_SDPA_QKT_TEST");
+  return enabled;
+}
+
 inline void check_config(const Config& cfg) {
   if (cfg.B <= 0 || cfg.N <= 0 || cfg.L <= 0 || cfg.S <= 0 ||
       cfg.E <= 0 || cfg.Ev <= 0) {
@@ -344,6 +352,10 @@ struct MK_Fp32PackK8PQuad {
       int64_t E, float scale,
       float* scores_buf, int64_t scores_row_stride) {
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
+    if (use_qkt_8x8_test()) {
+      qkt_8x8_test(Q, q_row_stride, Kp, 0, E, scale, scores_buf, scores_row_stride);
+      return;
+    }
     float32x4_t lo0 = vdupq_n_f32(0.0f), hi0 = vdupq_n_f32(0.0f);
     float32x4_t lo1 = vdupq_n_f32(0.0f), hi1 = vdupq_n_f32(0.0f);
     float32x4_t lo2 = vdupq_n_f32(0.0f), hi2 = vdupq_n_f32(0.0f);
@@ -457,6 +469,188 @@ struct MK_Fp32PackK8PQuad {
   }
 
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
+  // Experimental qkt_8x8 (FUSED_CPP_SDPA_QKT_TEST=1). Three changes vs official:
+  //  1. no zero-init: the first e-block seeds accumulators with vmul, then fmla.
+  //  2. K side held in 4 registers (kAl/kAh/kBl/kBh), reloaded mid-block so K
+  //     loads interleave with the FMAs instead of one big 8-register load.
+  //  3. Q is single-buffered software-pipelined: the next block's Q is loaded
+  //     one iteration ahead (16 accumulators leave no room to double-buffer all
+  //     8 Q vectors, so a single rolling set is used).
+  static inline void qkt_8x8_test(
+      const float* Q, int64_t q_row_stride,
+      const float* Kp, int64_t,
+      int64_t E, float scale,
+      float* scores_buf, int64_t scores_row_stride) {
+    const float* q0 = Q + 0 * q_row_stride;
+    const float* q1 = Q + 1 * q_row_stride;
+    const float* q2 = Q + 2 * q_row_stride;
+    const float* q3 = Q + 3 * q_row_stride;
+    const float* q4 = Q + 4 * q_row_stride;
+    const float* q5 = Q + 5 * q_row_stride;
+    const float* q6 = Q + 6 * q_row_stride;
+    const float* q7 = Q + 7 * q_row_stride;
+
+    float32x4_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
+    float32x4_t lo4, hi4, lo5, hi5, lo6, hi6, lo7, hi7;
+
+    if (E >= 4) {
+      float32x4_t kcur, knext;
+      float32x4_t qv0 = vld1q_f32(q0 + 0);
+      float32x4_t qv1 = vld1q_f32(q1 + 0);
+      float32x4_t qv2 = vld1q_f32(q2 + 0);
+      float32x4_t qv3 = vld1q_f32(q3 + 0);
+      float32x4_t qv4 = vld1q_f32(q4 + 0);
+      float32x4_t qv5 = vld1q_f32(q5 + 0);
+      float32x4_t qv6 = vld1q_f32(q6 + 0);
+      float32x4_t qv7 = vld1q_f32(q7 + 0);
+
+      // K is a contiguous stream of 128-bit vectors (Kp + e*8 + N*4). Each
+      // vector feeds 8 FMAs (one per row). It is held in a 2-register double
+      // buffer: while the 8 FMAs run on kcur, the next vector is loaded into
+      // knext, then swapped in. The 4-e block stays unrolled so the laneq
+      // index is a compile-time constant.
+#define FUSED_CPP_QKT_TEST_MUL(ACC, LANE)                     \
+      do {                                                    \
+        ACC##0 = vmulq_laneq_f32(kcur, qv0, LANE);            \
+        ACC##1 = vmulq_laneq_f32(kcur, qv1, LANE);            \
+        ACC##2 = vmulq_laneq_f32(kcur, qv2, LANE);            \
+        ACC##3 = vmulq_laneq_f32(kcur, qv3, LANE);            \
+        ACC##4 = vmulq_laneq_f32(kcur, qv4, LANE);            \
+        ACC##5 = vmulq_laneq_f32(kcur, qv5, LANE);            \
+        ACC##6 = vmulq_laneq_f32(kcur, qv6, LANE);            \
+        ACC##7 = vmulq_laneq_f32(kcur, qv7, LANE);            \
+      } while (0)
+#define FUSED_CPP_QKT_TEST_FMA(ACC, LANE)                     \
+      do {                                                    \
+        ACC##0 = vfmaq_laneq_f32(ACC##0, kcur, qv0, LANE);    \
+        ACC##1 = vfmaq_laneq_f32(ACC##1, kcur, qv1, LANE);    \
+        ACC##2 = vfmaq_laneq_f32(ACC##2, kcur, qv2, LANE);    \
+        ACC##3 = vfmaq_laneq_f32(ACC##3, kcur, qv3, LANE);    \
+        ACC##4 = vfmaq_laneq_f32(ACC##4, kcur, qv4, LANE);    \
+        ACC##5 = vfmaq_laneq_f32(ACC##5, kcur, qv5, LANE);    \
+        ACC##6 = vfmaq_laneq_f32(ACC##6, kcur, qv6, LANE);    \
+        ACC##7 = vfmaq_laneq_f32(ACC##7, kcur, qv7, LANE);    \
+      } while (0)
+
+      // ---- first block e=0..3: seed lo/hi (lane 0) with vmul, rest fmla ----
+      kcur  = vld1q_f32(Kp + 0);
+      knext = vld1q_f32(Kp + 4);   FUSED_CPP_QKT_TEST_MUL(lo, 0); kcur = knext;
+      knext = vld1q_f32(Kp + 8);   FUSED_CPP_QKT_TEST_MUL(hi, 0); kcur = knext;
+      knext = vld1q_f32(Kp + 12);  FUSED_CPP_QKT_TEST_FMA(lo, 1); kcur = knext;
+      knext = vld1q_f32(Kp + 16);  FUSED_CPP_QKT_TEST_FMA(hi, 1); kcur = knext;
+      knext = vld1q_f32(Kp + 20);  FUSED_CPP_QKT_TEST_FMA(lo, 2); kcur = knext;
+      knext = vld1q_f32(Kp + 24);  FUSED_CPP_QKT_TEST_FMA(hi, 2); kcur = knext;
+      knext = vld1q_f32(Kp + 28);  FUSED_CPP_QKT_TEST_FMA(lo, 3); kcur = knext;
+      FUSED_CPP_QKT_TEST_FMA(hi, 3);
+
+      int64_t e = 4;
+      // single-buffered Q software pipeline: preload first main block's Q
+      if (e + 4 <= E) {
+        qv0 = vld1q_f32(q0 + e); qv1 = vld1q_f32(q1 + e);
+        qv2 = vld1q_f32(q2 + e); qv3 = vld1q_f32(q3 + e);
+        qv4 = vld1q_f32(q4 + e); qv5 = vld1q_f32(q5 + e);
+        qv6 = vld1q_f32(q6 + e); qv7 = vld1q_f32(q7 + e);
+      }
+
+      constexpr int64_t kQktPrefetchDistance = 16;
+      for (; e + 4 <= E; e += 4) {
+        const int64_t e_pf = e + kQktPrefetchDistance;
+        if (e_pf < E) {
+          const float* k_pf = Kp + e_pf * 8;
+          ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf);
+          ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf + 16);
+        }
+
+        const float* kb = Kp + e * 8;
+        kcur  = vld1q_f32(kb + 0);
+        knext = vld1q_f32(kb + 4);   FUSED_CPP_QKT_TEST_FMA(lo, 0); kcur = knext;
+        knext = vld1q_f32(kb + 8);   FUSED_CPP_QKT_TEST_FMA(hi, 0); kcur = knext;
+        knext = vld1q_f32(kb + 12);  FUSED_CPP_QKT_TEST_FMA(lo, 1); kcur = knext;
+        knext = vld1q_f32(kb + 16);  FUSED_CPP_QKT_TEST_FMA(hi, 1); kcur = knext;
+        knext = vld1q_f32(kb + 20);  FUSED_CPP_QKT_TEST_FMA(lo, 2); kcur = knext;
+        knext = vld1q_f32(kb + 24);  FUSED_CPP_QKT_TEST_FMA(hi, 2); kcur = knext;
+        knext = vld1q_f32(kb + 28);  FUSED_CPP_QKT_TEST_FMA(lo, 3); kcur = knext;
+        FUSED_CPP_QKT_TEST_FMA(hi, 3);
+
+        // Q pipeline: preload next block's Q one iteration ahead
+        if (e + 8 <= E) {
+          qv0 = vld1q_f32(q0 + e + 4); qv1 = vld1q_f32(q1 + e + 4);
+          qv2 = vld1q_f32(q2 + e + 4); qv3 = vld1q_f32(q3 + e + 4);
+          qv4 = vld1q_f32(q4 + e + 4); qv5 = vld1q_f32(q5 + e + 4);
+          qv6 = vld1q_f32(q6 + e + 4); qv7 = vld1q_f32(q7 + e + 4);
+        }
+      }
+#undef FUSED_CPP_QKT_TEST_MUL
+#undef FUSED_CPP_QKT_TEST_FMA
+
+      // scalar tail for E % 4 != 0
+      for (; e < E; ++e) {
+        const float32x4_t kl = vld1q_f32(Kp + e * 8 + 0);
+        const float32x4_t kh = vld1q_f32(Kp + e * 8 + 4);
+#define FUSED_CPP_QKT_TEST_TAIL(ID, QROW)                     \
+        do {                                                  \
+          const float qf = QROW[e];                           \
+          lo##ID = vfmaq_n_f32(lo##ID, kl, qf);               \
+          hi##ID = vfmaq_n_f32(hi##ID, kh, qf);               \
+        } while (0)
+        FUSED_CPP_QKT_TEST_TAIL(0, q0);
+        FUSED_CPP_QKT_TEST_TAIL(1, q1);
+        FUSED_CPP_QKT_TEST_TAIL(2, q2);
+        FUSED_CPP_QKT_TEST_TAIL(3, q3);
+        FUSED_CPP_QKT_TEST_TAIL(4, q4);
+        FUSED_CPP_QKT_TEST_TAIL(5, q5);
+        FUSED_CPP_QKT_TEST_TAIL(6, q6);
+        FUSED_CPP_QKT_TEST_TAIL(7, q7);
+#undef FUSED_CPP_QKT_TEST_TAIL
+      }
+    } else {
+      // rare path E < 4: zero-init + scalar accumulate
+      lo0 = vdupq_n_f32(0.0f); hi0 = vdupq_n_f32(0.0f);
+      lo1 = vdupq_n_f32(0.0f); hi1 = vdupq_n_f32(0.0f);
+      lo2 = vdupq_n_f32(0.0f); hi2 = vdupq_n_f32(0.0f);
+      lo3 = vdupq_n_f32(0.0f); hi3 = vdupq_n_f32(0.0f);
+      lo4 = vdupq_n_f32(0.0f); hi4 = vdupq_n_f32(0.0f);
+      lo5 = vdupq_n_f32(0.0f); hi5 = vdupq_n_f32(0.0f);
+      lo6 = vdupq_n_f32(0.0f); hi6 = vdupq_n_f32(0.0f);
+      lo7 = vdupq_n_f32(0.0f); hi7 = vdupq_n_f32(0.0f);
+      for (int64_t e = 0; e < E; ++e) {
+        const float32x4_t kl = vld1q_f32(Kp + e * 8 + 0);
+        const float32x4_t kh = vld1q_f32(Kp + e * 8 + 4);
+#define FUSED_CPP_QKT_TEST_SMALL(ID, QROW)                    \
+        do {                                                  \
+          const float qf = QROW[e];                           \
+          lo##ID = vfmaq_n_f32(lo##ID, kl, qf);               \
+          hi##ID = vfmaq_n_f32(hi##ID, kh, qf);               \
+        } while (0)
+        FUSED_CPP_QKT_TEST_SMALL(0, q0);
+        FUSED_CPP_QKT_TEST_SMALL(1, q1);
+        FUSED_CPP_QKT_TEST_SMALL(2, q2);
+        FUSED_CPP_QKT_TEST_SMALL(3, q3);
+        FUSED_CPP_QKT_TEST_SMALL(4, q4);
+        FUSED_CPP_QKT_TEST_SMALL(5, q5);
+        FUSED_CPP_QKT_TEST_SMALL(6, q6);
+        FUSED_CPP_QKT_TEST_SMALL(7, q7);
+#undef FUSED_CPP_QKT_TEST_SMALL
+      }
+    }
+
+    (void)scale;  // scale folded into packed K
+#define FUSED_CPP_QKT_TEST_STORE(ID)                                   \
+    do {                                                               \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride + 0, lo##ID);    \
+      vst1q_f32(scores_buf + (ID) * scores_row_stride + 4, hi##ID);    \
+    } while (0)
+    FUSED_CPP_QKT_TEST_STORE(0);
+    FUSED_CPP_QKT_TEST_STORE(1);
+    FUSED_CPP_QKT_TEST_STORE(2);
+    FUSED_CPP_QKT_TEST_STORE(3);
+    FUSED_CPP_QKT_TEST_STORE(4);
+    FUSED_CPP_QKT_TEST_STORE(5);
+    FUSED_CPP_QKT_TEST_STORE(6);
+    FUSED_CPP_QKT_TEST_STORE(7);
+#undef FUSED_CPP_QKT_TEST_STORE
+  }
+
   static inline void qkt_8x8_rowmax(
       const float* Q, int64_t q_row_stride,
       const float* Kp, int64_t,

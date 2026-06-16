@@ -542,6 +542,231 @@ struct MK_Fp32PackK8PQuad {
 #endif
   }
 
+  // C[4 rows x 8 cols] = Q[4xE] . K^T over E. K cols 0-3 at Kp, cols 4-7 at
+  // Kp + kgroup_stride (the adjacent sblock4 group). Per buffer: 4 A + 8 B
+  // (two col-halves) + 8 C; a second A/B set double-buffers => 32 regs total.
+  // mul-seeded on the first e-block (no zero-init); scalar tail for E % 4.
+  static inline void qkt_4x8(
+      const float* Q, int64_t q_row_stride,
+      const float* Kp, int64_t kgroup_stride,
+      int64_t E, float scale,
+      float* scores_buf, int64_t scores_row_stride) {
+    (void)scale;  // folded into packed K
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+    const float* q0 = Q + 0 * q_row_stride;
+    const float* q1 = Q + 1 * q_row_stride;
+    const float* q2 = Q + 2 * q_row_stride;
+    const float* q3 = Q + 3 * q_row_stride;
+    const float* Kp2 = Kp + kgroup_stride;
+
+    float32x4_t c0a, c1a, c2a, c3a, c0b, c1b, c2b, c3b;
+    const int64_t nfull = (E / 4) * 4;
+    const int64_t nb = nfull / 4;
+
+    float32x4_t aq0, aq1, aq2, aq3, ak0, ak1, ak2, ak3, al0, al1, al2, al3;
+    float32x4_t bq0, bq1, bq2, bq3, bk0, bk1, bk2, bk3, bl0, bl1, bl2, bl3;
+#define QKT8_LOAD0(BLK)                                                    \
+    do { const int64_t e_ = (BLK) * 4; const int64_t ko = (BLK) * 16;      \
+      aq0 = vld1q_f32(q0 + e_); aq1 = vld1q_f32(q1 + e_);                  \
+      aq2 = vld1q_f32(q2 + e_); aq3 = vld1q_f32(q3 + e_);                  \
+      ak0 = vld1q_f32(Kp + ko + 0);  ak1 = vld1q_f32(Kp + ko + 4);        \
+      ak2 = vld1q_f32(Kp + ko + 8);  ak3 = vld1q_f32(Kp + ko + 12);       \
+      al0 = vld1q_f32(Kp2 + ko + 0); al1 = vld1q_f32(Kp2 + ko + 4);       \
+      al2 = vld1q_f32(Kp2 + ko + 8); al3 = vld1q_f32(Kp2 + ko + 12);      \
+    } while (0)
+#define QKT8_LOAD1(BLK)                                                    \
+    do { const int64_t e_ = (BLK) * 4; const int64_t ko = (BLK) * 16;      \
+      bq0 = vld1q_f32(q0 + e_); bq1 = vld1q_f32(q1 + e_);                  \
+      bq2 = vld1q_f32(q2 + e_); bq3 = vld1q_f32(q3 + e_);                  \
+      bk0 = vld1q_f32(Kp + ko + 0);  bk1 = vld1q_f32(Kp + ko + 4);        \
+      bk2 = vld1q_f32(Kp + ko + 8);  bk3 = vld1q_f32(Kp + ko + 12);       \
+      bl0 = vld1q_f32(Kp2 + ko + 0); bl1 = vld1q_f32(Kp2 + ko + 4);       \
+      bl2 = vld1q_f32(Kp2 + ko + 8); bl3 = vld1q_f32(Kp2 + ko + 12);      \
+    } while (0)
+#define QKT8_FMA0()                                                        \
+    mm4x4_fmla(c0a, c1a, c2a, c3a, aq0, aq1, aq2, aq3, ak0, ak1, ak2, ak3); \
+    mm4x4_fmla(c0b, c1b, c2b, c3b, aq0, aq1, aq2, aq3, al0, al1, al2, al3)
+#define QKT8_FMA1()                                                        \
+    mm4x4_fmla(c0a, c1a, c2a, c3a, bq0, bq1, bq2, bq3, bk0, bk1, bk2, bk3); \
+    mm4x4_fmla(c0b, c1b, c2b, c3b, bq0, bq1, bq2, bq3, bl0, bl1, bl2, bl3)
+
+    bool seeded = false;
+    if (nb > 0) {
+      // prologue: load0, load1, compute0* (mul-seed both col-halves)
+      QKT8_LOAD0(0);
+      if (nb >= 2) QKT8_LOAD1(1);
+      mm4x4_seed(c0a, c1a, c2a, c3a, aq0, aq1, aq2, aq3, ak0, ak1, ak2, ak3);
+      mm4x4_seed(c0b, c1b, c2b, c3b, aq0, aq1, aq2, aq3, al0, al1, al2, al3);
+      seeded = true;
+      // steady: load0, compute1, load1, compute0 (load one block ahead)
+      int64_t k = 2;
+      for (; k + 1 < nb; k += 2) {
+        QKT8_LOAD0(k);
+        QKT8_FMA1();
+        QKT8_LOAD1(k + 1);
+        QKT8_FMA0();
+      }
+      if (nb >= 2) {
+        if (k < nb) {
+          QKT8_LOAD0(k);
+          QKT8_FMA1();
+          QKT8_FMA0();
+        } else {
+          QKT8_FMA1();
+        }
+      }
+    }
+#undef QKT8_LOAD0
+#undef QKT8_LOAD1
+#undef QKT8_FMA0
+#undef QKT8_FMA1
+
+    int64_t et = nfull;
+    if (!seeded) {
+      const float32x4_t kva = vld1q_f32(Kp + et * 4);
+      const float32x4_t kvb = vld1q_f32(Kp2 + et * 4);
+      c0a = vmulq_n_f32(kva, q0[et]); c1a = vmulq_n_f32(kva, q1[et]);
+      c2a = vmulq_n_f32(kva, q2[et]); c3a = vmulq_n_f32(kva, q3[et]);
+      c0b = vmulq_n_f32(kvb, q0[et]); c1b = vmulq_n_f32(kvb, q1[et]);
+      c2b = vmulq_n_f32(kvb, q2[et]); c3b = vmulq_n_f32(kvb, q3[et]);
+      ++et;
+    }
+    for (; et < E; ++et) {
+      const float32x4_t kva = vld1q_f32(Kp + et * 4);
+      const float32x4_t kvb = vld1q_f32(Kp2 + et * 4);
+      c0a = vfmaq_n_f32(c0a, kva, q0[et]); c1a = vfmaq_n_f32(c1a, kva, q1[et]);
+      c2a = vfmaq_n_f32(c2a, kva, q2[et]); c3a = vfmaq_n_f32(c3a, kva, q3[et]);
+      c0b = vfmaq_n_f32(c0b, kvb, q0[et]); c1b = vfmaq_n_f32(c1b, kvb, q1[et]);
+      c2b = vfmaq_n_f32(c2b, kvb, q2[et]); c3b = vfmaq_n_f32(c3b, kvb, q3[et]);
+    }
+
+    vst1q_f32(scores_buf + 0 * scores_row_stride + 0, c0a);
+    vst1q_f32(scores_buf + 0 * scores_row_stride + 4, c0b);
+    vst1q_f32(scores_buf + 1 * scores_row_stride + 0, c1a);
+    vst1q_f32(scores_buf + 1 * scores_row_stride + 4, c1b);
+    vst1q_f32(scores_buf + 2 * scores_row_stride + 0, c2a);
+    vst1q_f32(scores_buf + 2 * scores_row_stride + 4, c2b);
+    vst1q_f32(scores_buf + 3 * scores_row_stride + 0, c3a);
+    vst1q_f32(scores_buf + 3 * scores_row_stride + 4, c3b);
+#else
+    (void)Q; (void)q_row_stride; (void)Kp; (void)kgroup_stride; (void)E;
+    (void)scale; (void)scores_buf; (void)scores_row_stride;
+#endif
+  }
+
+  // O[4 rows x 8 Ev] += P_hat[4xSk] . V[Skx8] over Sk. V cols 0-3 at V,
+  // cols 4-7 at V + v_group2_off (next ev_block for packed V, or +4 for
+  // contiguous V). C seeded from O => all fmla. scalar tail for Sk % 4.
+  static inline void pv_4x8(
+      const float* P_hat, int64_t P_row_stride,
+      const float* V, int64_t v_row_stride, int64_t v_group2_off,
+      int64_t Sk,
+      float* O, int64_t o_row_stride) {
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+    const float* p0 = P_hat + 0 * P_row_stride;
+    const float* p1 = P_hat + 1 * P_row_stride;
+    const float* p2 = P_hat + 2 * P_row_stride;
+    const float* p3 = P_hat + 3 * P_row_stride;
+    const float* V2 = V + v_group2_off;
+
+    float32x4_t c0a = vld1q_f32(O + 0 * o_row_stride + 0);
+    float32x4_t c0b = vld1q_f32(O + 0 * o_row_stride + 4);
+    float32x4_t c1a = vld1q_f32(O + 1 * o_row_stride + 0);
+    float32x4_t c1b = vld1q_f32(O + 1 * o_row_stride + 4);
+    float32x4_t c2a = vld1q_f32(O + 2 * o_row_stride + 0);
+    float32x4_t c2b = vld1q_f32(O + 2 * o_row_stride + 4);
+    float32x4_t c3a = vld1q_f32(O + 3 * o_row_stride + 0);
+    float32x4_t c3b = vld1q_f32(O + 3 * o_row_stride + 4);
+
+    const int64_t nfull = (Sk / 4) * 4;
+    const int64_t nb = nfull / 4;
+
+    float32x4_t ap0, ap1, ap2, ap3, av0, av1, av2, av3, aw0, aw1, aw2, aw3;
+    float32x4_t bp0, bp1, bp2, bp3, bv0, bv1, bv2, bv3, bw0, bw1, bw2, bw3;
+#define PV8_LOAD0(BLK)                                                     \
+    do { const int64_t s_ = (BLK) * 4;                                     \
+      ap0 = vld1q_f32(p0 + s_); ap1 = vld1q_f32(p1 + s_);                  \
+      ap2 = vld1q_f32(p2 + s_); ap3 = vld1q_f32(p3 + s_);                  \
+      av0 = vld1q_f32(V  + (s_ + 0) * v_row_stride);                       \
+      av1 = vld1q_f32(V  + (s_ + 1) * v_row_stride);                       \
+      av2 = vld1q_f32(V  + (s_ + 2) * v_row_stride);                       \
+      av3 = vld1q_f32(V  + (s_ + 3) * v_row_stride);                       \
+      aw0 = vld1q_f32(V2 + (s_ + 0) * v_row_stride);                       \
+      aw1 = vld1q_f32(V2 + (s_ + 1) * v_row_stride);                       \
+      aw2 = vld1q_f32(V2 + (s_ + 2) * v_row_stride);                       \
+      aw3 = vld1q_f32(V2 + (s_ + 3) * v_row_stride);                       \
+    } while (0)
+#define PV8_LOAD1(BLK)                                                     \
+    do { const int64_t s_ = (BLK) * 4;                                     \
+      bp0 = vld1q_f32(p0 + s_); bp1 = vld1q_f32(p1 + s_);                  \
+      bp2 = vld1q_f32(p2 + s_); bp3 = vld1q_f32(p3 + s_);                  \
+      bv0 = vld1q_f32(V  + (s_ + 0) * v_row_stride);                       \
+      bv1 = vld1q_f32(V  + (s_ + 1) * v_row_stride);                       \
+      bv2 = vld1q_f32(V  + (s_ + 2) * v_row_stride);                       \
+      bv3 = vld1q_f32(V  + (s_ + 3) * v_row_stride);                       \
+      bw0 = vld1q_f32(V2 + (s_ + 0) * v_row_stride);                       \
+      bw1 = vld1q_f32(V2 + (s_ + 1) * v_row_stride);                       \
+      bw2 = vld1q_f32(V2 + (s_ + 2) * v_row_stride);                       \
+      bw3 = vld1q_f32(V2 + (s_ + 3) * v_row_stride);                       \
+    } while (0)
+#define PV8_FMA0()                                                         \
+    mm4x4_fmla(c0a, c1a, c2a, c3a, ap0, ap1, ap2, ap3, av0, av1, av2, av3); \
+    mm4x4_fmla(c0b, c1b, c2b, c3b, ap0, ap1, ap2, ap3, aw0, aw1, aw2, aw3)
+#define PV8_FMA1()                                                         \
+    mm4x4_fmla(c0a, c1a, c2a, c3a, bp0, bp1, bp2, bp3, bv0, bv1, bv2, bv3); \
+    mm4x4_fmla(c0b, c1b, c2b, c3b, bp0, bp1, bp2, bp3, bw0, bw1, bw2, bw3)
+
+    if (nb > 0) {
+      // prologue: load0, load1, compute0 (fmla; C already seeded from O)
+      PV8_LOAD0(0);
+      if (nb >= 2) PV8_LOAD1(1);
+      PV8_FMA0();
+      // steady: load0, compute1, load1, compute0 (load one block ahead)
+      int64_t k = 2;
+      for (; k + 1 < nb; k += 2) {
+        PV8_LOAD0(k);
+        PV8_FMA1();
+        PV8_LOAD1(k + 1);
+        PV8_FMA0();
+      }
+      if (nb >= 2) {
+        if (k < nb) {
+          PV8_LOAD0(k);
+          PV8_FMA1();
+          PV8_FMA0();
+        } else {
+          PV8_FMA1();
+        }
+      }
+    }
+#undef PV8_LOAD0
+#undef PV8_LOAD1
+#undef PV8_FMA0
+#undef PV8_FMA1
+
+    for (int64_t st = nfull; st < Sk; ++st) {
+      const float32x4_t vv = vld1q_f32(V + st * v_row_stride);
+      const float32x4_t vw = vld1q_f32(V2 + st * v_row_stride);
+      c0a = vfmaq_n_f32(c0a, vv, p0[st]); c1a = vfmaq_n_f32(c1a, vv, p1[st]);
+      c2a = vfmaq_n_f32(c2a, vv, p2[st]); c3a = vfmaq_n_f32(c3a, vv, p3[st]);
+      c0b = vfmaq_n_f32(c0b, vw, p0[st]); c1b = vfmaq_n_f32(c1b, vw, p1[st]);
+      c2b = vfmaq_n_f32(c2b, vw, p2[st]); c3b = vfmaq_n_f32(c3b, vw, p3[st]);
+    }
+
+    vst1q_f32(O + 0 * o_row_stride + 0, c0a);
+    vst1q_f32(O + 0 * o_row_stride + 4, c0b);
+    vst1q_f32(O + 1 * o_row_stride + 0, c1a);
+    vst1q_f32(O + 1 * o_row_stride + 4, c1b);
+    vst1q_f32(O + 2 * o_row_stride + 0, c2a);
+    vst1q_f32(O + 2 * o_row_stride + 4, c2b);
+    vst1q_f32(O + 3 * o_row_stride + 0, c3a);
+    vst1q_f32(O + 3 * o_row_stride + 4, c3b);
+#else
+    (void)P_hat; (void)P_row_stride; (void)V; (void)v_row_stride;
+    (void)v_group2_off; (void)Sk; (void)O; (void)o_row_stride;
+#endif
+  }
+
 };
 
 

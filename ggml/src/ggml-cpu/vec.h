@@ -984,10 +984,45 @@ inline static void ggml_vec_gelu_erf_f16(const int n, ggml_fp16_t * y, const ggm
     }
 }
 
-#ifdef GGML_GELU_FP16
+#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
+// defined below alongside ggml_v_expf / ggml_v_silu
+inline static svfloat32_t ggml_v_gelu(svbool_t pg, svfloat32_t x);
+
+// Runtime path selector for A/B perf comparison (read once, cached):
+//   GGML_GELU_TABLE=1 -> force the original scalar f16-table/scalar path
+//   otherwise         -> SVE polynomial path (default)
+inline static int ggml_gelu_use_sve(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * e = getenv("GGML_GELU_TABLE");
+        cached = (e && e[0] == '1') ? 0 : 1;
+    }
+    return cached;
+}
+#endif
+
 inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
+    int i = 0;
+#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
+    if (ggml_gelu_use_sve()) {
+        const int vl = (int) svcntw();
+        const svbool_t pa = svptrue_b32();
+        for (; i + 4*vl <= n; i += 4*vl) {
+            svst1_f32(pa, y + i + 0*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 0*vl)));
+            svst1_f32(pa, y + i + 1*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 1*vl)));
+            svst1_f32(pa, y + i + 2*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 2*vl)));
+            svst1_f32(pa, y + i + 3*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 3*vl)));
+        }
+        for (; i < n; i += vl) {
+            const svbool_t pg = svwhilelt_b32_s32(i, n);
+            svst1_f32(pg, y + i, ggml_v_gelu(pg, svld1_f32(pg, x + i)));
+        }
+        return;
+    }
+#endif
+#ifdef GGML_GELU_FP16
     uint16_t t;
-    for (int i = 0; i < n; ++i) {
+    for (; i < n; ++i) {
         if (x[i] <= -10.0f) {
             y[i] = 0.0f;
         } else if (x[i] >= 10.0f) {
@@ -998,14 +1033,12 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
             y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]);
         }
     }
-}
 #else
-inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
-    for (int i = 0; i < n; ++i) {
+    for (; i < n; ++i) {
         y[i] = ggml_gelu_f32(x[i]);
     }
-}
 #endif
+}
 
 inline static void ggml_vec_gelu_erf_f32(const int n, float * y, const float * x) {
     for (int i = 0; i < n; ++i) {
@@ -1122,6 +1155,19 @@ inline static svfloat32_t ggml_v_silu(svbool_t pg, svfloat32_t x) {
     const svfloat32_t exp_neg_x = ggml_v_expf(pg, neg_x);
     const svfloat32_t one_plus_exp_neg_x = svadd_f32_x(pg, one, exp_neg_x);
     return svdiv_f32_x(pg, x, one_plus_exp_neg_x);
+}
+
+// computes the tanh-approximation gelu in single precision vector.
+// 0.5*x*(1+tanh(g)) is algebraically x/(1+exp(-2g)), reusing ggml_v_expf,
+// where g = SQRT_2_OVER_PI*x*(1 + GELU_COEF_A*x*x).
+inline static svfloat32_t ggml_v_gelu(svbool_t pg, svfloat32_t x) {
+    const svfloat32_t one   = svdup_n_f32_x(pg, 1.0f);
+    const svfloat32_t x2    = svmul_f32_x(pg, x, x);
+    const svfloat32_t inner = svmla_n_f32_x(pg, one, x2, GELU_COEF_A);
+    const svfloat32_t neg_2g =
+        svmul_f32_x(pg, svmul_n_f32_x(pg, x, -2.0f*SQRT_2_OVER_PI), inner);
+    const svfloat32_t e = ggml_v_expf(pg, neg_2g);
+    return svdiv_f32_x(pg, x, svadd_f32_x(pg, one, e));
 }
 
 #elif defined(__ARM_NEON) && defined(__aarch64__)

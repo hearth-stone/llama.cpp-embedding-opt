@@ -1034,11 +1034,23 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
     }
 #endif
 #ifdef GGML_GELU_FP16
-    for (; i + 4 <= n; i += 4) {
-        y[i+0] = ggml_gelu_f32_table(x[i+0]);
-        y[i+1] = ggml_gelu_f32_table(x[i+1]);
-        y[i+2] = ggml_gelu_f32_table(x[i+2]);
-        y[i+3] = ggml_gelu_f32_table(x[i+3]);
+    for (; i + 16 <= n; i += 16) {
+        y[i+ 0] = ggml_gelu_f32_table(x[i+ 0]);
+        y[i+ 1] = ggml_gelu_f32_table(x[i+ 1]);
+        y[i+ 2] = ggml_gelu_f32_table(x[i+ 2]);
+        y[i+ 3] = ggml_gelu_f32_table(x[i+ 3]);
+        y[i+ 4] = ggml_gelu_f32_table(x[i+ 4]);
+        y[i+ 5] = ggml_gelu_f32_table(x[i+ 5]);
+        y[i+ 6] = ggml_gelu_f32_table(x[i+ 6]);
+        y[i+ 7] = ggml_gelu_f32_table(x[i+ 7]);
+        y[i+ 8] = ggml_gelu_f32_table(x[i+ 8]);
+        y[i+ 9] = ggml_gelu_f32_table(x[i+ 9]);
+        y[i+10] = ggml_gelu_f32_table(x[i+10]);
+        y[i+11] = ggml_gelu_f32_table(x[i+11]);
+        y[i+12] = ggml_gelu_f32_table(x[i+12]);
+        y[i+13] = ggml_gelu_f32_table(x[i+13]);
+        y[i+14] = ggml_gelu_f32_table(x[i+14]);
+        y[i+15] = ggml_gelu_f32_table(x[i+15]);
     }
     for (; i < n; ++i) {
         y[i] = ggml_gelu_f32_table(x[i]);

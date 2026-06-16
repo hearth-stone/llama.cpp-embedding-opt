@@ -359,51 +359,68 @@ struct MK_Fp32PackK8PQuad {
 
     float32x4_t c0, c1, c2, c3;
     const int64_t nfull = (E / 4) * 4;
-    const int64_t nb = nfull / 4;
 
-    if (nb == 0) {
-      c0 = vdupq_n_f32(0.0f); c1 = vdupq_n_f32(0.0f);
-      c2 = vdupq_n_f32(0.0f); c3 = vdupq_n_f32(0.0f);
-    } else {
-      float32x4_t ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3;
-      float32x4_t ay0, ay1, ay2, ay3, by0, by1, by2, by3;
-#define QKT4_LOAD_X(EE)                                              \
-      do { const int64_t e_ = (EE);                                  \
-        ax0 = vld1q_f32(q0 + e_); ax1 = vld1q_f32(q1 + e_);          \
-        ax2 = vld1q_f32(q2 + e_); ax3 = vld1q_f32(q3 + e_);          \
-        bx0 = vld1q_f32(Kp + e_ * 4 + 0);  bx1 = vld1q_f32(Kp + e_ * 4 + 4);  \
-        bx2 = vld1q_f32(Kp + e_ * 4 + 8);  bx3 = vld1q_f32(Kp + e_ * 4 + 12); \
-      } while (0)
-#define QKT4_LOAD_Y(EE)                                              \
-      do { const int64_t e_ = (EE);                                  \
-        ay0 = vld1q_f32(q0 + e_); ay1 = vld1q_f32(q1 + e_);          \
-        ay2 = vld1q_f32(q2 + e_); ay3 = vld1q_f32(q3 + e_);          \
-        by0 = vld1q_f32(Kp + e_ * 4 + 0);  by1 = vld1q_f32(Kp + e_ * 4 + 4);  \
-        by2 = vld1q_f32(Kp + e_ * 4 + 8);  by3 = vld1q_f32(Kp + e_ * 4 + 12); \
-      } while (0)
-      QKT4_LOAD_X(0);
-      if (nb > 1) QKT4_LOAD_Y(4);
-      mm4x4_seed(c0, c1, c2, c3, ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3);
-      for (int64_t bi = 1; bi < nb; ++bi) {
-        const int64_t e_next = (bi + 1) * 4;
-        if ((bi & 1) == 1) {
-          if (bi + 1 < nb) QKT4_LOAD_X(e_next);
-          mm4x4_fmla(c0, c1, c2, c3, ay0, ay1, ay2, ay3, by0, by1, by2, by3);
+    float32x4_t qa0, qa1, qa2, qa3, ka0, ka1, ka2, ka3;  // buffer 0
+    float32x4_t qb0, qb1, qb2, qb3, kb0, kb1, kb2, kb3;  // buffer 1
+#define QKT4_LOAD0(BLK)                                                     \
+    do { const int64_t e_ = (BLK) * 4;                                      \
+      qa0 = vld1q_f32(q0 + e_); qa1 = vld1q_f32(q1 + e_);                   \
+      qa2 = vld1q_f32(q2 + e_); qa3 = vld1q_f32(q3 + e_);                   \
+      ka0 = vld1q_f32(Kp + e_ * 4 + 0);  ka1 = vld1q_f32(Kp + e_ * 4 + 4);  \
+      ka2 = vld1q_f32(Kp + e_ * 4 + 8);  ka3 = vld1q_f32(Kp + e_ * 4 + 12); \
+    } while (0)
+#define QKT4_LOAD1(BLK)                                                     \
+    do { const int64_t e_ = (BLK) * 4;                                      \
+      qb0 = vld1q_f32(q0 + e_); qb1 = vld1q_f32(q1 + e_);                   \
+      qb2 = vld1q_f32(q2 + e_); qb3 = vld1q_f32(q3 + e_);                   \
+      kb0 = vld1q_f32(Kp + e_ * 4 + 0);  kb1 = vld1q_f32(Kp + e_ * 4 + 4);  \
+      kb2 = vld1q_f32(Kp + e_ * 4 + 8);  kb3 = vld1q_f32(Kp + e_ * 4 + 12); \
+    } while (0)
+
+    const int64_t nb = nfull / 4;
+    bool seeded = false;
+    if (nb > 0) {
+      // prologue: load0, load1, compute0* (mul-seed; no zero-init)
+      QKT4_LOAD0(0);
+      if (nb >= 2) QKT4_LOAD1(1);
+      mm4x4_seed(c0, c1, c2, c3, qa0, qa1, qa2, qa3, ka0, ka1, ka2, ka3);
+      seeded = true;
+      // steady: load0, compute1, load1, compute0 (load one block ahead)
+      int64_t k = 2;
+      for (; k + 1 < nb; k += 2) {
+        QKT4_LOAD0(k);
+        mm4x4_fmla(c0, c1, c2, c3, qb0, qb1, qb2, qb3, kb0, kb1, kb2, kb3);
+        QKT4_LOAD1(k + 1);
+        mm4x4_fmla(c0, c1, c2, c3, qa0, qa1, qa2, qa3, ka0, ka1, ka2, ka3);
+      }
+      // epilogue: drain (two blocks remain when k<nb, else the last compute1)
+      if (nb >= 2) {
+        if (k < nb) {
+          QKT4_LOAD0(k);
+          mm4x4_fmla(c0, c1, c2, c3, qb0, qb1, qb2, qb3, kb0, kb1, kb2, kb3);
+          mm4x4_fmla(c0, c1, c2, c3, qa0, qa1, qa2, qa3, ka0, ka1, ka2, ka3);
         } else {
-          if (bi + 1 < nb) QKT4_LOAD_Y(e_next);
-          mm4x4_fmla(c0, c1, c2, c3, ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3);
+          mm4x4_fmla(c0, c1, c2, c3, qb0, qb1, qb2, qb3, kb0, kb1, kb2, kb3);
         }
       }
-#undef QKT4_LOAD_X
-#undef QKT4_LOAD_Y
     }
+#undef QKT4_LOAD0
+#undef QKT4_LOAD1
 
-    for (int64_t e = nfull; e < E; ++e) {
-      const float32x4_t kv = vld1q_f32(Kp + e * 4);
-      c0 = vfmaq_n_f32(c0, kv, q0[e]);
-      c1 = vfmaq_n_f32(c1, kv, q1[e]);
-      c2 = vfmaq_n_f32(c2, kv, q2[e]);
-      c3 = vfmaq_n_f32(c3, kv, q3[e]);
+    // tail: E % 4 (and the E < 4 case); mul-seed the first if not yet seeded
+    int64_t et = nfull;
+    if (!seeded) {
+      const float32x4_t kv = vld1q_f32(Kp + et * 4);
+      c0 = vmulq_n_f32(kv, q0[et]); c1 = vmulq_n_f32(kv, q1[et]);
+      c2 = vmulq_n_f32(kv, q2[et]); c3 = vmulq_n_f32(kv, q3[et]);
+      ++et;
+    }
+    for (; et < E; ++et) {
+      const float32x4_t kv = vld1q_f32(Kp + et * 4);
+      c0 = vfmaq_n_f32(c0, kv, q0[et]);
+      c1 = vfmaq_n_f32(c1, kv, q1[et]);
+      c2 = vfmaq_n_f32(c2, kv, q2[et]);
+      c3 = vfmaq_n_f32(c3, kv, q3[et]);
     }
 
     vst1q_f32(scores_buf + 0 * scores_row_stride, c0);
@@ -457,51 +474,63 @@ struct MK_Fp32PackK8PQuad {
     float32x4_t c3 = vld1q_f32(O + 3 * o_row_stride);
 
     const int64_t nfull = (Sk / 4) * 4;
+
+    float32x4_t pa0, pa1, pa2, pa3, va0, va1, va2, va3;  // buffer 0
+    float32x4_t pb0, pb1, pb2, pb3, vb0, vb1, vb2, vb3;  // buffer 1
+#define PV4_LOAD0(BLK)                                                  \
+    do { const int64_t s_ = (BLK) * 4;                                  \
+      pa0 = vld1q_f32(p0 + s_); pa1 = vld1q_f32(p1 + s_);               \
+      pa2 = vld1q_f32(p2 + s_); pa3 = vld1q_f32(p3 + s_);               \
+      va0 = vld1q_f32(V + (s_ + 0) * v_row_stride);                     \
+      va1 = vld1q_f32(V + (s_ + 1) * v_row_stride);                     \
+      va2 = vld1q_f32(V + (s_ + 2) * v_row_stride);                     \
+      va3 = vld1q_f32(V + (s_ + 3) * v_row_stride);                     \
+    } while (0)
+#define PV4_LOAD1(BLK)                                                  \
+    do { const int64_t s_ = (BLK) * 4;                                  \
+      pb0 = vld1q_f32(p0 + s_); pb1 = vld1q_f32(p1 + s_);               \
+      pb2 = vld1q_f32(p2 + s_); pb3 = vld1q_f32(p3 + s_);               \
+      vb0 = vld1q_f32(V + (s_ + 0) * v_row_stride);                     \
+      vb1 = vld1q_f32(V + (s_ + 1) * v_row_stride);                     \
+      vb2 = vld1q_f32(V + (s_ + 2) * v_row_stride);                     \
+      vb3 = vld1q_f32(V + (s_ + 3) * v_row_stride);                     \
+    } while (0)
+
     const int64_t nb = nfull / 4;
     if (nb > 0) {
-      float32x4_t ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3;
-      float32x4_t ay0, ay1, ay2, ay3, by0, by1, by2, by3;
-#define PV4_LOAD_X(SS)                                              \
-      do { const int64_t s_ = (SS);                                 \
-        ax0 = vld1q_f32(p0 + s_); ax1 = vld1q_f32(p1 + s_);         \
-        ax2 = vld1q_f32(p2 + s_); ax3 = vld1q_f32(p3 + s_);         \
-        bx0 = vld1q_f32(V + (s_ + 0) * v_row_stride);               \
-        bx1 = vld1q_f32(V + (s_ + 1) * v_row_stride);               \
-        bx2 = vld1q_f32(V + (s_ + 2) * v_row_stride);               \
-        bx3 = vld1q_f32(V + (s_ + 3) * v_row_stride);               \
-      } while (0)
-#define PV4_LOAD_Y(SS)                                              \
-      do { const int64_t s_ = (SS);                                 \
-        ay0 = vld1q_f32(p0 + s_); ay1 = vld1q_f32(p1 + s_);         \
-        ay2 = vld1q_f32(p2 + s_); ay3 = vld1q_f32(p3 + s_);         \
-        by0 = vld1q_f32(V + (s_ + 0) * v_row_stride);               \
-        by1 = vld1q_f32(V + (s_ + 1) * v_row_stride);               \
-        by2 = vld1q_f32(V + (s_ + 2) * v_row_stride);               \
-        by3 = vld1q_f32(V + (s_ + 3) * v_row_stride);               \
-      } while (0)
-      PV4_LOAD_X(0);
-      if (nb > 1) PV4_LOAD_Y(4);
-      mm4x4_fmla(c0, c1, c2, c3, ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3);
-      for (int64_t bi = 1; bi < nb; ++bi) {
-        const int64_t s_next = (bi + 1) * 4;
-        if ((bi & 1) == 1) {
-          if (bi + 1 < nb) PV4_LOAD_X(s_next);
-          mm4x4_fmla(c0, c1, c2, c3, ay0, ay1, ay2, ay3, by0, by1, by2, by3);
+      // prologue: load0, load1, compute0 (fmla; C already seeded from O)
+      PV4_LOAD0(0);
+      if (nb >= 2) PV4_LOAD1(1);
+      mm4x4_fmla(c0, c1, c2, c3, pa0, pa1, pa2, pa3, va0, va1, va2, va3);
+      // steady: load0, compute1, load1, compute0 (load one block ahead)
+      int64_t k = 2;
+      for (; k + 1 < nb; k += 2) {
+        PV4_LOAD0(k);
+        mm4x4_fmla(c0, c1, c2, c3, pb0, pb1, pb2, pb3, vb0, vb1, vb2, vb3);
+        PV4_LOAD1(k + 1);
+        mm4x4_fmla(c0, c1, c2, c3, pa0, pa1, pa2, pa3, va0, va1, va2, va3);
+      }
+      // epilogue: drain (two blocks remain when k<nb, else the last compute1)
+      if (nb >= 2) {
+        if (k < nb) {
+          PV4_LOAD0(k);
+          mm4x4_fmla(c0, c1, c2, c3, pb0, pb1, pb2, pb3, vb0, vb1, vb2, vb3);
+          mm4x4_fmla(c0, c1, c2, c3, pa0, pa1, pa2, pa3, va0, va1, va2, va3);
         } else {
-          if (bi + 1 < nb) PV4_LOAD_Y(s_next);
-          mm4x4_fmla(c0, c1, c2, c3, ax0, ax1, ax2, ax3, bx0, bx1, bx2, bx3);
+          mm4x4_fmla(c0, c1, c2, c3, pb0, pb1, pb2, pb3, vb0, vb1, vb2, vb3);
         }
       }
-#undef PV4_LOAD_X
-#undef PV4_LOAD_Y
     }
+#undef PV4_LOAD0
+#undef PV4_LOAD1
 
-    for (int64_t s = nfull; s < Sk; ++s) {
-      const float32x4_t vv = vld1q_f32(V + s * v_row_stride);
-      c0 = vfmaq_n_f32(c0, vv, p0[s]);
-      c1 = vfmaq_n_f32(c1, vv, p1[s]);
-      c2 = vfmaq_n_f32(c2, vv, p2[s]);
-      c3 = vfmaq_n_f32(c3, vv, p3[s]);
+    // tail: Sk % 4
+    for (int64_t st = nfull; st < Sk; ++st) {
+      const float32x4_t vv = vld1q_f32(V + st * v_row_stride);
+      c0 = vfmaq_n_f32(c0, vv, p0[st]);
+      c1 = vfmaq_n_f32(c1, vv, p1[st]);
+      c2 = vfmaq_n_f32(c2, vv, p2[st]);
+      c3 = vfmaq_n_f32(c3, vv, p3[st]);
     }
 
     vst1q_f32(O + 0 * o_row_stride, c0);

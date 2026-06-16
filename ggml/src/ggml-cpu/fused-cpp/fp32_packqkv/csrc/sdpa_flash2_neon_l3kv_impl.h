@@ -927,40 +927,13 @@ inline void process_q_tile_lc(
         if (s_l2 > max_causal) break;
       }
 
-      // ── 双缓冲 L2 软件预取 ──
-      // packed 与非 packed 都按 v_stride_s 跳一行：non-packed 下 v_stride_s = Ev,
-      // packed 下 v_stride_s = 8。两者的 prefetch 起点都是「下一段 KV tile
-      // 起始的若干 cache line」，逻辑等价。
-      {
-        const int64_t s_next = s_l2 + ts.Sc_l2;
-        if (s_next < s_l3_end) {
-          const scalar_t* K_base_next = k_ptr + b * k_stride_b
-                                              + n * k_stride_n;
-          const scalar_t* K_next =
-              k_tile_ptr_impl<MK, scalar_t>(
-                  K_base_next, s_next, k_stride_s, p.E);
-          const scalar_t* V_next = v_ptr + b * v_stride_b
-                                         + n * v_stride_n
-                                         + s_next * v_stride_s;
-          for (int line = 0; line < 4; ++line) {
-            prefetch_l2_keep_impl(reinterpret_cast<const char*>(K_next) + line * 64);
-            prefetch_l2_keep_impl(reinterpret_cast<const char*>(V_next) + line * 64);
-          }
-        }
-      }
-
-      // K_tile / V_tile 起始指针。
+      // K/V are contiguous after packing -> the HW stride prefetcher covers
+      // both the current and next KV tile; no explicit K/V prefetch.
       const scalar_t* Kbase = k_ptr + b * k_stride_b + n * k_stride_n;
-      const scalar_t* Krow0 =
-          k_tile_ptr_impl<MK, scalar_t>(Kbase, s_l2, k_stride_s, p.E);
       // packed 路径下 Vbase 指向 [b][n][ev_block=0][s_l2][lane=0]，
       // 后面再按 (ev_off>>3) * v_evblock_stride 跳到正确 ev_block。
       const scalar_t* Vbase = v_ptr + b * v_stride_b + n * v_stride_n
                                     + s_l2 * v_stride_s;
-
-      for (int line = 0; line < 2; ++line) {
-        prefetch_l1_keep_impl(reinterpret_cast<const char*>(Krow0) + line * 64);
-      }
 
       for (int64_t qi_inner = 0; qi_inner < num_inner; ++qi_inner) {
         const int64_t q0_inner = q0_outer + qi_inner * LQ_INNER;
@@ -1011,12 +984,6 @@ inline void process_q_tile_lc(
           }
         }
 #endif
-
-        if (qi_inner + 2 < num_inner) {
-          for (int line = 0; line < 2; ++line) {
-            prefetch_l1_keep_impl(reinterpret_cast<const char*>(Vbase) + line * 64);
-          }
-        }
 
         constexpr int64_t kMaxTrackedPvSkip = 4096;
         uint8_t pv_skip_s[kMaxTrackedPvSkip];
@@ -1514,25 +1481,7 @@ inline void process_q_tile_lc(
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
           constexpr int64_t kPvEvStep = has_pv_8x16_v<MK, scalar_t> ? 16 : 8;
           for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += kPvEvStep) {
-            // ── packv 路径下的 V cold prefetch ──
-            // 非 packed 路径上 ev_off += 8 只是行内偏移（同一 cache line 后半），
-            // HW prefetcher 已经覆盖。但 packv layout 下 ev_off += 8 = 跳到
-            // 下一个 ev_block，物理地址跨 S*32 字节（典型 S=2048 fp32 时
-            // 64KiB），远超 stride prefetcher 跟踪窗口（A-class typical
-            // ≤4KiB stride）。在每次 ev_off 切换时把下一个 ev_block 起始的
-            // 2 cache line 提前进 L1，覆盖 ~80–200 cycle 的 LLC→L1 延迟，
-            // 与 PV inner 循环并行。
-            if constexpr (kPackedV) {
-              if (ev_off + kPvEvStep < p.Ev) {
-                const scalar_t* next_block =
-                    Vbase + ((ev_off + kPvEvStep) >> 3) * v_evblock_stride;
-                for (int line = 0; line < 2; ++line) {
-                  prefetch_l1_keep_impl(
-                      reinterpret_cast<const char*>(next_block) + line * 64);
-                }
-              }
-            }
-
+            // V is contiguous within an ev_block; HW prefetcher covers it.
             const int64_t Ev_cur = std::min<int64_t>(kPvEvStep, p.Ev - ev_off);
 
             const scalar_t* V_tile;

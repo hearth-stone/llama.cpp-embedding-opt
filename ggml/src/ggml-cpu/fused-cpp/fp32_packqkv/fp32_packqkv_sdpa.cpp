@@ -378,15 +378,8 @@ struct MK_Fp32PackK8PQuad {
     // without vector-register moves and measured faster than GCC 13 for this
     // qkt_8x8 kernel. Source-level lane staging did not improve GCC output.
     int64_t e = 0;
-    constexpr int64_t kQktPrefetchDistance = 16;
+    // K is sblock8-packed (contiguous); HW stride prefetcher covers it.
     for (; e + 4 <= E; e += 4) {
-      const int64_t e_pf = e + kQktPrefetchDistance;
-      if (e_pf < E) {
-        const float* k_pf = Kp + e_pf * 8;
-        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf);
-        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf + 16);
-      }
-
       const float32x4_t k0l = vld1q_f32(Kp + (e + 0) * 8 + 0);
       const float32x4_t k0h = vld1q_f32(Kp + (e + 0) * 8 + 4);
       const float32x4_t k1l = vld1q_f32(Kp + (e + 1) * 8 + 0);
@@ -677,15 +670,8 @@ struct MK_Fp32PackK8PQuad {
     const float* q7 = Q + 7 * q_row_stride;
 
     int64_t e = 0;
-    constexpr int64_t kQktPrefetchDistance = 16;
+    // K is sblock8-packed (contiguous); HW stride prefetcher covers it.
     for (; e + 4 <= E; e += 4) {
-      const int64_t e_pf = e + kQktPrefetchDistance;
-      if (e_pf < E) {
-        const float* k_pf = Kp + e_pf * 8;
-        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf);
-        ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl(k_pf + 16);
-      }
-
       const float32x4_t k0l = vld1q_f32(Kp + (e + 0) * 8 + 0);
       const float32x4_t k0h = vld1q_f32(Kp + (e + 0) * 8 + 4);
       const float32x4_t k1l = vld1q_f32(Kp + (e + 1) * 8 + 0);

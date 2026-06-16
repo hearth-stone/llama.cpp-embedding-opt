@@ -1001,6 +1001,19 @@ inline static int ggml_gelu_use_sve(void) {
 }
 #endif
 
+#ifdef GGML_GELU_FP16
+// one-element f16-table gelu (clamped); factored out so the loop can be unrolled,
+// keeping multiple independent table loads in flight to hide load latency.
+inline static float ggml_gelu_f32_table(float xi) {
+    if (xi <= -10.0f) return 0.0f;
+    if (xi >=  10.0f) return xi;
+    uint16_t t;
+    ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(xi);
+    memcpy(&t, &fp16, sizeof(uint16_t));
+    return GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]);
+}
+#endif
+
 inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
     int i = 0;
 #if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
@@ -1021,17 +1034,14 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
     }
 #endif
 #ifdef GGML_GELU_FP16
-    uint16_t t;
+    for (; i + 4 <= n; i += 4) {
+        y[i+0] = ggml_gelu_f32_table(x[i+0]);
+        y[i+1] = ggml_gelu_f32_table(x[i+1]);
+        y[i+2] = ggml_gelu_f32_table(x[i+2]);
+        y[i+3] = ggml_gelu_f32_table(x[i+3]);
+    }
     for (; i < n; ++i) {
-        if (x[i] <= -10.0f) {
-            y[i] = 0.0f;
-        } else if (x[i] >= 10.0f) {
-            y[i] = x[i];
-        } else {
-            ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
-            memcpy(&t, &fp16, sizeof(uint16_t));
-            y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]);
-        }
+        y[i] = ggml_gelu_f32_table(x[i]);
     }
 #else
     for (; i < n; ++i) {

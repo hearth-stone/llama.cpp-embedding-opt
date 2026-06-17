@@ -19,6 +19,7 @@
 #include "sdpa_pack_utils.h"
 #include "sdpa_flash2_neon_l3kv_impl.h"
 #include "sdpa_microkernels/neon_cache_microkernels.h"
+#include "sdpa_microkernels/impls/mk_fp32_pack16_6x16.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -1439,6 +1440,296 @@ const char* selected_mk_name() {
   return MK_Fp32PackK8PQuad::kName;
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// KleidiAI-style 6x16 stream-B path (width-16 k-major packed K/V, NEON fp32,
+// SVE softmax). Self-contained two-pass SDPA so the 8x8 path stays untouched.
+// Selected by FUSED_CPP_SDPA_KERNEL (default "6x16" on this branch).
+// ──────────────────────────────────────────────────────────────────────
+
+bool use_pack16_6x16() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("FUSED_CPP_SDPA_KERNEL");
+    if (env == nullptr || env[0] == '\0') {
+      return true;  // default ON for the 6x16 branch
+    }
+    return std::strcmp(env, "6x16") == 0;
+  }();
+  return enabled;
+}
+
+const char* pack16_mk_name() { return "fp32_pack16_6x16"; }
+
+namespace impl16 = ::fused_cpp::sdpa_flash2_neon_l3kv_impl;
+namespace mk16 = ::fused_cpp::sdpa_pack16;
+using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::MaskBlockKind;
+
+// Process one query tile of up to 6 rows: QKT -> softmax (SVE) -> PV, two-pass.
+// Head-level phase-separated SDPA: do ALL QKT (packed-K stays L2-hot) -> ALL
+// softmax -> ALL PV (packed-V stays L2-hot). Avoids the per-tile QKT<->PV L2
+// thrash (128KB K + 128KB V) that halves QKT throughput in-context.
+template <bool kCausal, bool kHasMask>
+void process_head_6x16(
+    const SdpaParams& p,
+    int64_t b, int64_t n,
+    const float* qh, ElementStrides q_stride,
+    float* oh, ElementStrides out_stride,
+    const float* kp, const float* vp,
+    int64_t S_b16, int64_t Ev_b16,
+    float* scores_loc /*6*SC*/, float* o_acc /*L*Ev*/,
+    float* running_max /*L*/, float* running_sum /*L*/) {
+  const int64_t S = p.S, E = p.E, Ev = p.Ev, L = p.L;
+  const int64_t qrs = q_stride.t;
+  const bool direct_mask = kHasMask && impl16::has_direct_mask_impl(p);
+  const float* mask32 = kHasMask ? p.mask_ptr : nullptr;
+  const int64_t SC = S;  // untiled (S-tiling measured slower on this HW for S<=512)
+
+  auto row_len = [&](int64_t l) -> int {
+    if constexpr (kCausal) {
+      const int64_t lim = l + p.causal_offset;
+      return static_cast<int>(std::max<int64_t>(0, std::min<int64_t>(S, lim + 1)));
+    } else {
+      return static_cast<int>(S);
+    }
+  };
+
+  for (int64_t l = 0; l < L; ++l) {
+    running_max[l] = p.neg_inf;
+    running_sum[l] = 0.0f;
+  }
+  std::memset(o_acc, 0, sizeof(float) * L * Ev);
+
+  // Flash2: S-tile OUTER (K/V chunk reused from L1 across all query rows),
+  // query-micro-tile (6 rows) INNER, with online softmax rescale of o_acc.
+  for (int64_t s0 = 0; s0 < S; s0 += SC) {
+    const int Sc = static_cast<int>(std::min<int64_t>(SC, S - s0));
+    for (int64_t qi = 0; qi < L; qi += 6) {
+      int R;
+      int64_t q0;
+      if (L - qi >= 6) { R = 6; q0 = qi; }
+      else if (L >= 6) { R = 6; q0 = L - 6; }   // overlap last tile -> all R=6
+      else { R = static_cast<int>(L); q0 = 0; }
+      const float* Q = qh + q0 * qrs;
+
+      // Per-row visible length within this S-tile.
+      int len_tile[6];
+      int tile_active = 0;
+      for (int i = 0; i < R; ++i) {
+        int v = Sc;
+        if constexpr (kCausal) {
+          v = static_cast<int>(std::min<int64_t>(
+              Sc, std::max<int64_t>(0, (int64_t)row_len(q0 + i) - s0)));
+        }
+        len_tile[i] = v;
+        if (v > tile_active) tile_active = v;
+      }
+      if (tile_active <= 0) {
+        continue;  // whole S-tile beyond visible for this query tile
+      }
+
+      // ── QKT: scores_loc[R][Sc] (row stride Sc), per-row tile max ──
+      float tmax[6];
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+      float32x4_t rmv[6];
+#endif
+      {
+      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+      for (int i = 0; i < 6; ++i) rmv[i] = vdupq_n_f32(p.neg_inf);
+#endif
+      for (int i = 0; i < R; ++i) tmax[i] = p.neg_inf;
+      for (int sub = 0; sub < Sc; sub += 16) {
+        const int64_t s = s0 + sub;
+        if (s >= s0 + tile_active) break;
+        const int Sk = static_cast<int>(std::min<int64_t>(16, Sc - sub));
+        const float* Kp = kp + (s / 16) * E * 16;
+        float* sc = scores_loc + sub;  // row stride Sc
+
+        MaskBlockKind mk_kind = MaskBlockKind::kMixed;
+        if (direct_mask) {
+          mk_kind = impl16::classify_direct_mask_block_impl(p, b, n, q0, s, R, Sk);
+        }
+        if (direct_mask && mk_kind == MaskBlockKind::kAllOff) {
+          impl16::fill_scores_block_impl(sc, Sc, R, Sk, p.neg_inf);
+          continue;
+        }
+        const bool fuse = !kCausal && Sk == 16 && mask32 == nullptr &&
+                          (!direct_mask || mk_kind == MaskBlockKind::kAllZero);
+        if (fuse) {
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+          mk16::qkt_6x16_rowmax_vec(Q, qrs, Kp, E, sc, Sc, R, rmv);
+#else
+          mk16::qkt_6x16_rowmax(Q, qrs, Kp, E, sc, Sc, R, tmax);
+#endif
+          continue;
+        }
+        mk16::qkt_6x16_tile(Q, qrs, Kp, E, sc, Sc, R, Sk);
+        if (direct_mask && mk_kind == MaskBlockKind::kMixed) {
+          impl16::add_direct_mask_to_scores_block_impl(p, b, n, q0, s, R, Sk, sc, Sc);
+        }
+        if (mask32 != nullptr) {
+          for (int i = 0; i < R; ++i) {
+            const float* mrow = mask32 + (((b * p.N + n) * p.L) + (q0 + i)) * S + s;
+            float* r = sc + i * Sc;
+            for (int j = 0; j < Sk; ++j) r[j] += mrow[j];
+          }
+        }
+        for (int i = 0; i < R; ++i) {
+          int valid = Sk;
+          if constexpr (kCausal) {
+            valid = static_cast<int>(std::min<int64_t>(
+                Sk, std::max<int64_t>(0, (int64_t)len_tile[i] - sub)));
+          }
+          const float* r = sc + i * Sc;
+          float m = tmax[i];
+          for (int j = 0; j < valid; ++j) {
+            if (r[j] > m) m = r[j];
+          }
+          tmax[i] = m;
+        }
+      }
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+      for (int i = 0; i < R; ++i) tmax[i] = std::max(tmax[i], vmaxvq_f32(rmv[i]));
+#endif
+      }  // kQkt
+
+      // ── online rescale + exp (scores_loc -> phat in place) ──
+      {
+      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kSoftmax);
+      for (int i = 0; i < R; ++i) {
+        const int64_t l = q0 + i;
+        const int len_i = len_tile[i];
+        float* prow = scores_loc + i * Sc;
+        if (len_i <= 0 || tmax[i] == p.neg_inf) {
+          std::memset(prow, 0, sizeof(float) * Sc);
+          continue;
+        }
+        float new_max, corr;
+        if (running_max[l] == p.neg_inf) {
+          new_max = tmax[i];
+          corr = 1.0f;
+        } else {
+          new_max = std::max(running_max[l], tmax[i]);
+          corr = std::exp(running_max[l] - new_max);
+        }
+        if (corr != 1.0f) {
+          running_sum[l] *= corr;
+          impl16::scale_inplace_impl(o_acc + l * Ev, corr, Ev);
+        }
+        const float rs =
+            impl16::vectorized_exp_minus_impl(prow, prow, new_max, len_i);
+        if (len_i < Sc) std::memset(prow + len_i, 0, sizeof(float) * (Sc - len_i));
+        running_sum[l] += rs;
+        running_max[l] = new_max;
+      }
+      }  // kSoftmax
+
+      // ── PV: o_acc[q0..] += phat[R][Sc] . V-chunk(Sc) ──
+      {
+      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
+      for (int64_t evb = 0; evb < Ev_b16; ++evb) {
+        const int Ev_cur = static_cast<int>(std::min<int64_t>(16, Ev - evb * 16));
+        const float* Vp = vp + evb * S * 16 + s0 * 16;
+        mk16::pv_6x16_tile(scores_loc, Sc, Vp, 16, tile_active,
+                           o_acc + q0 * Ev + evb * 16, Ev, R, Ev_cur);
+      }
+      }  // kPv
+    }
+  }
+
+  // ── finalize: O = o_acc / running_sum ──
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kFinalize);
+    for (int64_t l = 0; l < L; ++l) {
+      float* o = oh + l * out_stride.t;
+      if (p.max_logits_ptr != nullptr || p.lse_ptr != nullptr) {
+        const int64_t stats_idx = b * (p.N * p.L) + n * p.L + l;
+        if (p.max_logits_ptr != nullptr) p.max_logits_ptr[stats_idx] = running_max[l];
+        if (p.lse_ptr != nullptr) {
+          p.lse_ptr[stats_idx] = running_sum[l] > 0.0f
+              ? running_max[l] + std::log(running_sum[l])
+              : std::numeric_limits<float>::infinity();
+        }
+      }
+      if (running_sum[l] > 0.0f) {
+        const float inv = 1.0f / running_sum[l];
+        for (int64_t ev = 0; ev < Ev; ++ev) o[ev] = o_acc[l * Ev + ev] * inv;
+      } else {
+        for (int64_t ev = 0; ev < Ev; ++ev) o[ev] = 0.0f;
+      }
+    }
+  }
+}
+
+template <bool kCausal, bool kHasMask>
+void run_pack16_6x16(
+    const SdpaParams& p,
+    ElementStrides q_stride, ElementStrides k_stride,
+    ElementStrides v_stride, ElementStrides out_stride) {
+  const float* q = static_cast<const float*>(p.q_ptr);
+  const float* k = static_cast<const float*>(p.k_ptr);
+  const float* v = static_cast<const float*>(p.v_ptr);
+  const int64_t B = p.B, N = p.N, L = p.L, S = p.S, E = p.E, Ev = p.Ev;
+  const int64_t kpack = mk16::k_packed_size_per_head(S, E);
+  const int64_t vpack = mk16::v_packed_size_per_head(S, Ev);
+  const int64_t S_b16 = mk16::ceil_div16(S);
+  const int64_t Ev_b16 = mk16::ceil_div16(Ev);
+
+  FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMain);
+#ifdef _OPENMP
+  #pragma omp parallel
+#endif
+  {
+    // Grow-only per-thread buffers (avoid per-op malloc churn).
+    static thread_local AlignedVector<float> kp, vp, scores_loc, o_acc, running_max, running_sum;
+    kp.resize(static_cast<size_t>(kpack));
+    vp.resize(static_cast<size_t>(vpack));
+    scores_loc.resize(static_cast<size_t>(6 * S));
+    o_acc.resize(static_cast<size_t>(L * Ev));
+    running_max.resize(static_cast<size_t>(L));
+    running_sum.resize(static_cast<size_t>(L));
+#ifdef _OPENMP
+    #pragma omp for collapse(2) schedule(static)
+#endif
+    for (int64_t b = 0; b < B; ++b) {
+      for (int64_t n = 0; n < N; ++n) {
+        const float* qh = q + b * q_stride.b + n * q_stride.n;
+        const float* kh = k + b * k_stride.b + n * k_stride.n;
+        const float* vh = v + b * v_stride.b + n * v_stride.n;
+        float* oh = p.out_ptr + b * out_stride.b + n * out_stride.n;
+        mk16::pack_k_to_sblock16_one_head(
+            kh, kp.data(), S, E, k_stride.t, k_stride.d, p.scale_f);
+        mk16::pack_v_to_evblock16_one_head(
+            vh, vp.data(), S, Ev, v_stride.t, v_stride.d);
+        process_head_6x16<kCausal, kHasMask>(
+            p, b, n, qh, q_stride, oh, out_stride,
+            kp.data(), vp.data(), S_b16, Ev_b16,
+            scores_loc.data(), o_acc.data(), running_max.data(), running_sum.data());
+      }
+    }
+  }
+}
+
+void run_selected_pack16_6x16(
+    const SdpaParams& p,
+    ElementStrides q_stride, ElementStrides k_stride,
+    ElementStrides v_stride, ElementStrides out_stride) {
+  const bool has_mask = p.mask_ptr != nullptr || p.mask_f16_ptr != nullptr ||
+                        p.mask_f32_ptr != nullptr;
+  if (p.is_causal) {
+    if (has_mask) {
+      run_pack16_6x16<true, true>(p, q_stride, k_stride, v_stride, out_stride);
+    } else {
+      run_pack16_6x16<true, false>(p, q_stride, k_stride, v_stride, out_stride);
+    }
+  } else {
+    if (has_mask) {
+      run_pack16_6x16<false, true>(p, q_stride, k_stride, v_stride, out_stride);
+    } else {
+      run_pack16_6x16<false, false>(p, q_stride, k_stride, v_stride, out_stride);
+    }
+  }
+}
+
 int64_t byte_stride_to_float_elems(int64_t byte_stride) {
   if ((byte_stride % static_cast<int64_t>(sizeof(float))) != 0) {
     throw std::invalid_argument("byte stride must be divisible by sizeof(float)");
@@ -1524,6 +1815,18 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
   }
   const uint64_t profile_total_t0 =
       profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
+
+  if (use_pack16_6x16()) {
+    run_selected_pack16_6x16(p, q_stride, k_stride, v_stride, out_stride);
+    if (profile_on) {
+      ::fused_cpp::sdpa_profile::add(
+          ::fused_cpp::sdpa_profile::Slot::kTotal,
+          ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
+      ::fused_cpp::sdpa_profile::print_summary(
+          "fp32_packqkv_standalone", pack16_mk_name(), p, "6x16");
+    }
+    return;
+  }
 
   TileSizes ts = compute_tile_sizes_l3kv(
       cfg.B, cfg.N, cfg.S, cfg.L, cfg.E, cfg.Ev, sizeof(float));

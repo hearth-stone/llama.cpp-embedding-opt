@@ -147,6 +147,9 @@ flake.lock
 /run-vim.sh
 /run-chat.sh
 /run-spec.sh
+/.kiro/
+/rsync.sh
+/mteb_accuracy_compare/
 /.ccache/
 
 # IDE

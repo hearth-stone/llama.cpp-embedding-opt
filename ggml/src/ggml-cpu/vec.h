@@ -61,6 +61,9 @@ extern "C" {
 // precomputed gelu table for f16 (128 KB)
 extern ggml_fp16_t ggml_table_gelu_f16[1 << 16];
 
+// precomputed gelu table with f32 outputs (256 KB)
+extern float ggml_table_gelu_f32[1 << 16];
+
 // precomputed quick gelu table for f16 (128 KB)
 extern ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 
@@ -984,56 +987,193 @@ inline static void ggml_vec_gelu_erf_f16(const int n, ggml_fp16_t * y, const ggm
     }
 }
 
-#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
-// defined below alongside ggml_v_expf / ggml_v_silu
-inline static svfloat32_t ggml_v_gelu(svbool_t pg, svfloat32_t x);
+#define GGML_GELU_MODE_TABLE 0
+#define GGML_GELU_MODE_FP32  1
+#define GGML_GELU_MODE_FP16  2
+#define GGML_GELU_MODE_TABLE_F32          3
+#define GGML_GELU_MODE_TABLE_F32_PREFETCH 4
+#define GGML_GELU_MODE_TABLE_F32_GATHER   5
 
-// Runtime path selector for A/B perf comparison (read once, cached):
-//   GGML_GELU_TABLE=1 -> force the original scalar f16-table/scalar path
-//   otherwise         -> SVE polynomial path (default)
-inline static int ggml_gelu_use_sve(void) {
+inline static int ggml_gelu_default_mode(void) {
+#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
+    return GGML_GELU_MODE_FP32;
+#elif defined(GGML_GELU_FP16)
+    return GGML_GELU_MODE_TABLE;
+#else
+    return GGML_GELU_MODE_FP32;
+#endif
+}
+
+// Runtime path selector for A/B perf comparison (read once, cached).
+// GGML_GELU_MODE=fp32  -> SVE f32 polynomial path when available
+// GGML_GELU_MODE=fp16  -> SVE f16 polynomial path when available, scalar fallback otherwise
+// GGML_GELU_MODE=table -> f16-table path
+// GGML_GELU_MODE=table_f32 -> f32-output table path
+// GGML_GELU_MODE=table_f32_prefetch -> f32-output table path with prefetch
+// GGML_GELU_MODE=table_f32_gather -> SVE f32 gather table path when available
+// GGML_GELU_TABLE=1    -> compatibility alias for table
+inline static int ggml_gelu_mode(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char * e = getenv("GGML_GELU_TABLE");
-        cached = (e && e[0] == '1') ? 0 : 1;
+        cached = ggml_gelu_default_mode();
+
+        const char * mode = getenv("GGML_GELU_MODE");
+        if (mode) {
+            const bool is_table_f32 =
+                (mode[0] == 't' || mode[0] == 'T') &&
+                (mode[1] == 'a' || mode[1] == 'A') &&
+                (mode[2] == 'b' || mode[2] == 'B') &&
+                (mode[3] == 'l' || mode[3] == 'L') &&
+                (mode[4] == 'e' || mode[4] == 'E') &&
+                mode[5] == '_' &&
+                (mode[6] == 'f' || mode[6] == 'F') &&
+                mode[7] == '3' &&
+                mode[8] == '2';
+            if (is_table_f32 &&
+                    mode[9] == '_' &&
+                    (mode[10] == 'p' || mode[10] == 'P')) {
+                cached = GGML_GELU_MODE_TABLE_F32_PREFETCH;
+            } else if (is_table_f32 &&
+                    mode[9] == '_' &&
+                    (mode[10] == 'g' || mode[10] == 'G')) {
+                cached = GGML_GELU_MODE_TABLE_F32_GATHER;
+            } else if (is_table_f32) {
+                cached = GGML_GELU_MODE_TABLE_F32;
+            } else if (mode[0] == 't' || mode[0] == 'T' || mode[0] == '0') {
+                cached = GGML_GELU_MODE_TABLE;
+            } else if ((mode[0] == 'f' || mode[0] == 'F') && mode[1] == 'p' && mode[2] == '1' && mode[3] == '6') {
+                cached = GGML_GELU_MODE_FP16;
+            } else if ((mode[0] == 'f' || mode[0] == 'F') && mode[1] == '1' && mode[2] == '6') {
+                cached = GGML_GELU_MODE_FP16;
+            } else if (mode[0] == '1' && mode[1] == '6') {
+                cached = GGML_GELU_MODE_FP16;
+            } else if ((mode[0] == 'f' || mode[0] == 'F') && mode[1] == 'p' && mode[2] == '3' && mode[3] == '2') {
+                cached = GGML_GELU_MODE_FP32;
+            } else if ((mode[0] == 'f' || mode[0] == 'F') && mode[1] == '3' && mode[2] == '2') {
+                cached = GGML_GELU_MODE_FP32;
+            } else if (mode[0] == '3' && mode[1] == '2') {
+                cached = GGML_GELU_MODE_FP32;
+            }
+        }
+
+        const char * table = getenv("GGML_GELU_TABLE");
+        if (table && table[0] == '1') {
+            cached = GGML_GELU_MODE_TABLE;
+        }
     }
     return cached;
 }
+
+#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
+// defined below alongside ggml_v_expf / ggml_v_silu
+inline static svfloat32_t ggml_v_gelu(svbool_t pg, svfloat32_t x);
+inline static void ggml_v_gelu_2(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1,
+        svfloat32_t * y0, svfloat32_t * y1);
+inline static void ggml_v_gelu_4(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1, svfloat32_t x2, svfloat32_t x3,
+        svfloat32_t * y0, svfloat32_t * y1, svfloat32_t * y2, svfloat32_t * y3);
+inline static void ggml_v_gelu_8(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1, svfloat32_t x2, svfloat32_t x3,
+        svfloat32_t x4, svfloat32_t x5, svfloat32_t x6, svfloat32_t x7,
+        svfloat32_t * y0, svfloat32_t * y1, svfloat32_t * y2, svfloat32_t * y3,
+        svfloat32_t * y4, svfloat32_t * y5, svfloat32_t * y6, svfloat32_t * y7);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+inline static svfloat32_t ggml_v_gelu_f16(svbool_t pg, svfloat32_t x);
+#endif
+inline static svfloat32_t ggml_v_gelu_table_f32(svbool_t pg, svfloat32_t x);
 #endif
 
 #ifdef GGML_GELU_FP16
+inline static uint16_t ggml_gelu_f32_table_index(float xi) {
+    uint16_t t;
+    ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(xi);
+    memcpy(&t, &fp16, sizeof(uint16_t));
+    return t;
+}
+
 // one-element f16-table gelu (clamped); factored out so the loop can be unrolled,
 // keeping multiple independent table loads in flight to hide load latency.
 inline static float ggml_gelu_f32_table(float xi) {
     if (xi <= -10.0f) return 0.0f;
     if (xi >=  10.0f) return xi;
-    uint16_t t;
-    ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(xi);
-    memcpy(&t, &fp16, sizeof(uint16_t));
-    return GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]);
+    return GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[ggml_gelu_f32_table_index(xi)]);
 }
-#endif
 
-inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
-    int i = 0;
-#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
-    if (ggml_gelu_use_sve()) {
-        const int vl = (int) svcntw();
-        const svbool_t pa = svptrue_b32();
-        for (; i + 4*vl <= n; i += 4*vl) {
-            svst1_f32(pa, y + i + 0*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 0*vl)));
-            svst1_f32(pa, y + i + 1*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 1*vl)));
-            svst1_f32(pa, y + i + 2*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 2*vl)));
-            svst1_f32(pa, y + i + 3*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 3*vl)));
-        }
-        for (; i < n; i += vl) {
-            const svbool_t pg = svwhilelt_b32_s32(i, n);
-            svst1_f32(pg, y + i, ggml_v_gelu(pg, svld1_f32(pg, x + i)));
-        }
-        return;
+inline static float ggml_gelu_f32_table_f32(float xi) {
+    if (xi <= -10.0f) return 0.0f;
+    if (xi >=  10.0f) return xi;
+    return ggml_table_gelu_f32[ggml_gelu_f32_table_index(xi)];
+}
+
+inline static void ggml_gelu_f32_table_f32_prefetch(float xi) {
+#if defined(__GNUC__) || defined(__clang__)
+    if (xi > -10.0f && xi < 10.0f) {
+        __builtin_prefetch(&ggml_table_gelu_f32[ggml_gelu_f32_table_index(xi)], 0, 1);
     }
+#else
+    GGML_UNUSED(xi);
 #endif
-#ifdef GGML_GELU_FP16
+}
+
+inline static int ggml_gelu_prefetch_dist(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 32;
+        const char * dist = getenv("GGML_GELU_PREFETCH_DIST");
+        if (dist) {
+            int value = 0;
+            for (int i = 0; dist[i] >= '0' && dist[i] <= '9'; ++i) {
+                value = 10*value + (dist[i] - '0');
+            }
+            cached = value;
+        }
+    }
+    return cached;
+}
+
+inline static int ggml_gelu_table_f32_unroll(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 8;
+        const char * unroll = getenv("GGML_GELU_UNROLL");
+        if (unroll) {
+            int value = 0;
+            for (int i = 0; unroll[i] >= '0' && unroll[i] <= '9'; ++i) {
+                value = 10*value + (unroll[i] - '0');
+            }
+            if (value == 1 || value == 2 || value == 4 || value == 8 ||
+                    value == 16 || value == 32 || value == 64) {
+                cached = value;
+            }
+        }
+    }
+    return cached;
+}
+
+inline static int ggml_gelu_sve_unroll(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 4;
+        const char * unroll = getenv("GGML_GELU_SVE_UNROLL");
+        if (unroll) {
+            int value = 0;
+            for (int i = 0; unroll[i] >= '0' && unroll[i] <= '9'; ++i) {
+                value = 10*value + (unroll[i] - '0');
+            }
+            if (value == 0 || value == 1 || value == 2 || value == 4 || value == 8) {
+                cached = value;
+            }
+        }
+    }
+    return cached;
+}
+
+inline static void ggml_vec_gelu_f32_table_f16(const int n, float * y, const float * x) {
+    int i = 0;
     for (; i + 16 <= n; i += 16) {
         y[i+ 0] = ggml_gelu_f32_table(x[i+ 0]);
         y[i+ 1] = ggml_gelu_f32_table(x[i+ 1]);
@@ -1054,6 +1194,363 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
     }
     for (; i < n; ++i) {
         y[i] = ggml_gelu_f32_table(x[i]);
+    }
+}
+
+#define GGML_GELU_TABLE_F32_0   y[i+ 0] = ggml_gelu_f32_table_f32(x[i+ 0]);
+#define GGML_GELU_TABLE_F32_1   y[i+ 1] = ggml_gelu_f32_table_f32(x[i+ 1]);
+#define GGML_GELU_TABLE_F32_2   y[i+ 2] = ggml_gelu_f32_table_f32(x[i+ 2]);
+#define GGML_GELU_TABLE_F32_3   y[i+ 3] = ggml_gelu_f32_table_f32(x[i+ 3]);
+#define GGML_GELU_TABLE_F32_4   y[i+ 4] = ggml_gelu_f32_table_f32(x[i+ 4]);
+#define GGML_GELU_TABLE_F32_5   y[i+ 5] = ggml_gelu_f32_table_f32(x[i+ 5]);
+#define GGML_GELU_TABLE_F32_6   y[i+ 6] = ggml_gelu_f32_table_f32(x[i+ 6]);
+#define GGML_GELU_TABLE_F32_7   y[i+ 7] = ggml_gelu_f32_table_f32(x[i+ 7]);
+#define GGML_GELU_TABLE_F32_8   y[i+ 8] = ggml_gelu_f32_table_f32(x[i+ 8]);
+#define GGML_GELU_TABLE_F32_9   y[i+ 9] = ggml_gelu_f32_table_f32(x[i+ 9]);
+#define GGML_GELU_TABLE_F32_10  y[i+10] = ggml_gelu_f32_table_f32(x[i+10]);
+#define GGML_GELU_TABLE_F32_11  y[i+11] = ggml_gelu_f32_table_f32(x[i+11]);
+#define GGML_GELU_TABLE_F32_12  y[i+12] = ggml_gelu_f32_table_f32(x[i+12]);
+#define GGML_GELU_TABLE_F32_13  y[i+13] = ggml_gelu_f32_table_f32(x[i+13]);
+#define GGML_GELU_TABLE_F32_14  y[i+14] = ggml_gelu_f32_table_f32(x[i+14]);
+#define GGML_GELU_TABLE_F32_15  y[i+15] = ggml_gelu_f32_table_f32(x[i+15]);
+#define GGML_GELU_TABLE_F32_16  y[i+16] = ggml_gelu_f32_table_f32(x[i+16]);
+#define GGML_GELU_TABLE_F32_17  y[i+17] = ggml_gelu_f32_table_f32(x[i+17]);
+#define GGML_GELU_TABLE_F32_18  y[i+18] = ggml_gelu_f32_table_f32(x[i+18]);
+#define GGML_GELU_TABLE_F32_19  y[i+19] = ggml_gelu_f32_table_f32(x[i+19]);
+#define GGML_GELU_TABLE_F32_20  y[i+20] = ggml_gelu_f32_table_f32(x[i+20]);
+#define GGML_GELU_TABLE_F32_21  y[i+21] = ggml_gelu_f32_table_f32(x[i+21]);
+#define GGML_GELU_TABLE_F32_22  y[i+22] = ggml_gelu_f32_table_f32(x[i+22]);
+#define GGML_GELU_TABLE_F32_23  y[i+23] = ggml_gelu_f32_table_f32(x[i+23]);
+#define GGML_GELU_TABLE_F32_24  y[i+24] = ggml_gelu_f32_table_f32(x[i+24]);
+#define GGML_GELU_TABLE_F32_25  y[i+25] = ggml_gelu_f32_table_f32(x[i+25]);
+#define GGML_GELU_TABLE_F32_26  y[i+26] = ggml_gelu_f32_table_f32(x[i+26]);
+#define GGML_GELU_TABLE_F32_27  y[i+27] = ggml_gelu_f32_table_f32(x[i+27]);
+#define GGML_GELU_TABLE_F32_28  y[i+28] = ggml_gelu_f32_table_f32(x[i+28]);
+#define GGML_GELU_TABLE_F32_29  y[i+29] = ggml_gelu_f32_table_f32(x[i+29]);
+#define GGML_GELU_TABLE_F32_30  y[i+30] = ggml_gelu_f32_table_f32(x[i+30]);
+#define GGML_GELU_TABLE_F32_31  y[i+31] = ggml_gelu_f32_table_f32(x[i+31]);
+#define GGML_GELU_TABLE_F32_32  y[i+32] = ggml_gelu_f32_table_f32(x[i+32]);
+#define GGML_GELU_TABLE_F32_33  y[i+33] = ggml_gelu_f32_table_f32(x[i+33]);
+#define GGML_GELU_TABLE_F32_34  y[i+34] = ggml_gelu_f32_table_f32(x[i+34]);
+#define GGML_GELU_TABLE_F32_35  y[i+35] = ggml_gelu_f32_table_f32(x[i+35]);
+#define GGML_GELU_TABLE_F32_36  y[i+36] = ggml_gelu_f32_table_f32(x[i+36]);
+#define GGML_GELU_TABLE_F32_37  y[i+37] = ggml_gelu_f32_table_f32(x[i+37]);
+#define GGML_GELU_TABLE_F32_38  y[i+38] = ggml_gelu_f32_table_f32(x[i+38]);
+#define GGML_GELU_TABLE_F32_39  y[i+39] = ggml_gelu_f32_table_f32(x[i+39]);
+#define GGML_GELU_TABLE_F32_40  y[i+40] = ggml_gelu_f32_table_f32(x[i+40]);
+#define GGML_GELU_TABLE_F32_41  y[i+41] = ggml_gelu_f32_table_f32(x[i+41]);
+#define GGML_GELU_TABLE_F32_42  y[i+42] = ggml_gelu_f32_table_f32(x[i+42]);
+#define GGML_GELU_TABLE_F32_43  y[i+43] = ggml_gelu_f32_table_f32(x[i+43]);
+#define GGML_GELU_TABLE_F32_44  y[i+44] = ggml_gelu_f32_table_f32(x[i+44]);
+#define GGML_GELU_TABLE_F32_45  y[i+45] = ggml_gelu_f32_table_f32(x[i+45]);
+#define GGML_GELU_TABLE_F32_46  y[i+46] = ggml_gelu_f32_table_f32(x[i+46]);
+#define GGML_GELU_TABLE_F32_47  y[i+47] = ggml_gelu_f32_table_f32(x[i+47]);
+#define GGML_GELU_TABLE_F32_48  y[i+48] = ggml_gelu_f32_table_f32(x[i+48]);
+#define GGML_GELU_TABLE_F32_49  y[i+49] = ggml_gelu_f32_table_f32(x[i+49]);
+#define GGML_GELU_TABLE_F32_50  y[i+50] = ggml_gelu_f32_table_f32(x[i+50]);
+#define GGML_GELU_TABLE_F32_51  y[i+51] = ggml_gelu_f32_table_f32(x[i+51]);
+#define GGML_GELU_TABLE_F32_52  y[i+52] = ggml_gelu_f32_table_f32(x[i+52]);
+#define GGML_GELU_TABLE_F32_53  y[i+53] = ggml_gelu_f32_table_f32(x[i+53]);
+#define GGML_GELU_TABLE_F32_54  y[i+54] = ggml_gelu_f32_table_f32(x[i+54]);
+#define GGML_GELU_TABLE_F32_55  y[i+55] = ggml_gelu_f32_table_f32(x[i+55]);
+#define GGML_GELU_TABLE_F32_56  y[i+56] = ggml_gelu_f32_table_f32(x[i+56]);
+#define GGML_GELU_TABLE_F32_57  y[i+57] = ggml_gelu_f32_table_f32(x[i+57]);
+#define GGML_GELU_TABLE_F32_58  y[i+58] = ggml_gelu_f32_table_f32(x[i+58]);
+#define GGML_GELU_TABLE_F32_59  y[i+59] = ggml_gelu_f32_table_f32(x[i+59]);
+#define GGML_GELU_TABLE_F32_60  y[i+60] = ggml_gelu_f32_table_f32(x[i+60]);
+#define GGML_GELU_TABLE_F32_61  y[i+61] = ggml_gelu_f32_table_f32(x[i+61]);
+#define GGML_GELU_TABLE_F32_62  y[i+62] = ggml_gelu_f32_table_f32(x[i+62]);
+#define GGML_GELU_TABLE_F32_63  y[i+63] = ggml_gelu_f32_table_f32(x[i+63]);
+
+#define GGML_GELU_TABLE_F32_DO_1   GGML_GELU_TABLE_F32_0
+#define GGML_GELU_TABLE_F32_DO_2   GGML_GELU_TABLE_F32_DO_1  GGML_GELU_TABLE_F32_1
+#define GGML_GELU_TABLE_F32_DO_4   GGML_GELU_TABLE_F32_DO_2  GGML_GELU_TABLE_F32_2  GGML_GELU_TABLE_F32_3
+#define GGML_GELU_TABLE_F32_DO_8   GGML_GELU_TABLE_F32_DO_4  GGML_GELU_TABLE_F32_4  GGML_GELU_TABLE_F32_5  GGML_GELU_TABLE_F32_6  GGML_GELU_TABLE_F32_7
+#define GGML_GELU_TABLE_F32_DO_16  GGML_GELU_TABLE_F32_DO_8  GGML_GELU_TABLE_F32_8  GGML_GELU_TABLE_F32_9  GGML_GELU_TABLE_F32_10 GGML_GELU_TABLE_F32_11 GGML_GELU_TABLE_F32_12 GGML_GELU_TABLE_F32_13 GGML_GELU_TABLE_F32_14 GGML_GELU_TABLE_F32_15
+#define GGML_GELU_TABLE_F32_DO_32  GGML_GELU_TABLE_F32_DO_16 GGML_GELU_TABLE_F32_16 GGML_GELU_TABLE_F32_17 GGML_GELU_TABLE_F32_18 GGML_GELU_TABLE_F32_19 GGML_GELU_TABLE_F32_20 GGML_GELU_TABLE_F32_21 GGML_GELU_TABLE_F32_22 GGML_GELU_TABLE_F32_23 GGML_GELU_TABLE_F32_24 GGML_GELU_TABLE_F32_25 GGML_GELU_TABLE_F32_26 GGML_GELU_TABLE_F32_27 GGML_GELU_TABLE_F32_28 GGML_GELU_TABLE_F32_29 GGML_GELU_TABLE_F32_30 GGML_GELU_TABLE_F32_31
+#define GGML_GELU_TABLE_F32_DO_64  GGML_GELU_TABLE_F32_DO_32 GGML_GELU_TABLE_F32_32 GGML_GELU_TABLE_F32_33 GGML_GELU_TABLE_F32_34 GGML_GELU_TABLE_F32_35 GGML_GELU_TABLE_F32_36 GGML_GELU_TABLE_F32_37 GGML_GELU_TABLE_F32_38 GGML_GELU_TABLE_F32_39 GGML_GELU_TABLE_F32_40 GGML_GELU_TABLE_F32_41 GGML_GELU_TABLE_F32_42 GGML_GELU_TABLE_F32_43 GGML_GELU_TABLE_F32_44 GGML_GELU_TABLE_F32_45 GGML_GELU_TABLE_F32_46 GGML_GELU_TABLE_F32_47 GGML_GELU_TABLE_F32_48 GGML_GELU_TABLE_F32_49 GGML_GELU_TABLE_F32_50 GGML_GELU_TABLE_F32_51 GGML_GELU_TABLE_F32_52 GGML_GELU_TABLE_F32_53 GGML_GELU_TABLE_F32_54 GGML_GELU_TABLE_F32_55 GGML_GELU_TABLE_F32_56 GGML_GELU_TABLE_F32_57 GGML_GELU_TABLE_F32_58 GGML_GELU_TABLE_F32_59 GGML_GELU_TABLE_F32_60 GGML_GELU_TABLE_F32_61 GGML_GELU_TABLE_F32_62 GGML_GELU_TABLE_F32_63
+
+#define GGML_GELU_TABLE_F32_RUN(N) \
+    for (; i + (N) <= n; i += (N)) { \
+        GGML_GELU_TABLE_F32_DO_##N \
+    }
+
+inline static void ggml_vec_gelu_f32_table_f32(const int n, float * y, const float * x) {
+    int i = 0;
+    switch (ggml_gelu_table_f32_unroll()) {
+        case 1:  GGML_GELU_TABLE_F32_RUN(1);  break;
+        case 2:  GGML_GELU_TABLE_F32_RUN(2);  break;
+        case 4:  GGML_GELU_TABLE_F32_RUN(4);  break;
+        case 8:  GGML_GELU_TABLE_F32_RUN(8);  break;
+        case 32: GGML_GELU_TABLE_F32_RUN(32); break;
+        case 64: GGML_GELU_TABLE_F32_RUN(64); break;
+        case 16:
+        default: GGML_GELU_TABLE_F32_RUN(16); break;
+    }
+    for (; i < n; ++i) {
+        y[i] = ggml_gelu_f32_table_f32(x[i]);
+    }
+}
+
+#undef GGML_GELU_TABLE_F32_RUN
+#undef GGML_GELU_TABLE_F32_DO_64
+#undef GGML_GELU_TABLE_F32_DO_32
+#undef GGML_GELU_TABLE_F32_DO_16
+#undef GGML_GELU_TABLE_F32_DO_8
+#undef GGML_GELU_TABLE_F32_DO_4
+#undef GGML_GELU_TABLE_F32_DO_2
+#undef GGML_GELU_TABLE_F32_DO_1
+#undef GGML_GELU_TABLE_F32_63
+#undef GGML_GELU_TABLE_F32_62
+#undef GGML_GELU_TABLE_F32_61
+#undef GGML_GELU_TABLE_F32_60
+#undef GGML_GELU_TABLE_F32_59
+#undef GGML_GELU_TABLE_F32_58
+#undef GGML_GELU_TABLE_F32_57
+#undef GGML_GELU_TABLE_F32_56
+#undef GGML_GELU_TABLE_F32_55
+#undef GGML_GELU_TABLE_F32_54
+#undef GGML_GELU_TABLE_F32_53
+#undef GGML_GELU_TABLE_F32_52
+#undef GGML_GELU_TABLE_F32_51
+#undef GGML_GELU_TABLE_F32_50
+#undef GGML_GELU_TABLE_F32_49
+#undef GGML_GELU_TABLE_F32_48
+#undef GGML_GELU_TABLE_F32_47
+#undef GGML_GELU_TABLE_F32_46
+#undef GGML_GELU_TABLE_F32_45
+#undef GGML_GELU_TABLE_F32_44
+#undef GGML_GELU_TABLE_F32_43
+#undef GGML_GELU_TABLE_F32_42
+#undef GGML_GELU_TABLE_F32_41
+#undef GGML_GELU_TABLE_F32_40
+#undef GGML_GELU_TABLE_F32_39
+#undef GGML_GELU_TABLE_F32_38
+#undef GGML_GELU_TABLE_F32_37
+#undef GGML_GELU_TABLE_F32_36
+#undef GGML_GELU_TABLE_F32_35
+#undef GGML_GELU_TABLE_F32_34
+#undef GGML_GELU_TABLE_F32_33
+#undef GGML_GELU_TABLE_F32_32
+#undef GGML_GELU_TABLE_F32_31
+#undef GGML_GELU_TABLE_F32_30
+#undef GGML_GELU_TABLE_F32_29
+#undef GGML_GELU_TABLE_F32_28
+#undef GGML_GELU_TABLE_F32_27
+#undef GGML_GELU_TABLE_F32_26
+#undef GGML_GELU_TABLE_F32_25
+#undef GGML_GELU_TABLE_F32_24
+#undef GGML_GELU_TABLE_F32_23
+#undef GGML_GELU_TABLE_F32_22
+#undef GGML_GELU_TABLE_F32_21
+#undef GGML_GELU_TABLE_F32_20
+#undef GGML_GELU_TABLE_F32_19
+#undef GGML_GELU_TABLE_F32_18
+#undef GGML_GELU_TABLE_F32_17
+#undef GGML_GELU_TABLE_F32_16
+#undef GGML_GELU_TABLE_F32_15
+#undef GGML_GELU_TABLE_F32_14
+#undef GGML_GELU_TABLE_F32_13
+#undef GGML_GELU_TABLE_F32_12
+#undef GGML_GELU_TABLE_F32_11
+#undef GGML_GELU_TABLE_F32_10
+#undef GGML_GELU_TABLE_F32_9
+#undef GGML_GELU_TABLE_F32_8
+#undef GGML_GELU_TABLE_F32_7
+#undef GGML_GELU_TABLE_F32_6
+#undef GGML_GELU_TABLE_F32_5
+#undef GGML_GELU_TABLE_F32_4
+#undef GGML_GELU_TABLE_F32_3
+#undef GGML_GELU_TABLE_F32_2
+#undef GGML_GELU_TABLE_F32_1
+#undef GGML_GELU_TABLE_F32_0
+
+inline static void ggml_vec_gelu_f32_table_f32_prefetch(const int n, float * y, const float * x) {
+    const int pd = ggml_gelu_prefetch_dist();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const int p = i + pd;
+        if (p + 15 < n) {
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 0]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 1]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 2]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 3]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 4]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 5]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 6]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 7]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 8]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+ 9]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+10]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+11]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+12]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+13]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+14]);
+            ggml_gelu_f32_table_f32_prefetch(x[p+15]);
+        }
+        y[i+ 0] = ggml_gelu_f32_table_f32(x[i+ 0]);
+        y[i+ 1] = ggml_gelu_f32_table_f32(x[i+ 1]);
+        y[i+ 2] = ggml_gelu_f32_table_f32(x[i+ 2]);
+        y[i+ 3] = ggml_gelu_f32_table_f32(x[i+ 3]);
+        y[i+ 4] = ggml_gelu_f32_table_f32(x[i+ 4]);
+        y[i+ 5] = ggml_gelu_f32_table_f32(x[i+ 5]);
+        y[i+ 6] = ggml_gelu_f32_table_f32(x[i+ 6]);
+        y[i+ 7] = ggml_gelu_f32_table_f32(x[i+ 7]);
+        y[i+ 8] = ggml_gelu_f32_table_f32(x[i+ 8]);
+        y[i+ 9] = ggml_gelu_f32_table_f32(x[i+ 9]);
+        y[i+10] = ggml_gelu_f32_table_f32(x[i+10]);
+        y[i+11] = ggml_gelu_f32_table_f32(x[i+11]);
+        y[i+12] = ggml_gelu_f32_table_f32(x[i+12]);
+        y[i+13] = ggml_gelu_f32_table_f32(x[i+13]);
+        y[i+14] = ggml_gelu_f32_table_f32(x[i+14]);
+        y[i+15] = ggml_gelu_f32_table_f32(x[i+15]);
+    }
+    for (; i < n; ++i) {
+        y[i] = ggml_gelu_f32_table_f32(x[i]);
+    }
+}
+#endif
+
+inline static float ggml_round_f16_f32(float x) {
+    return GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(x));
+}
+
+inline static float ggml_gelu_f32_fp16(float xi) {
+    const float x = ggml_round_f16_f32(xi);
+    const float x2 = ggml_round_f16_f32(x*x);
+    const float inner = ggml_round_f16_f32(1.0f + ggml_round_f16_f32(GELU_COEF_A)*x2);
+    const float neg_2g = ggml_round_f16_f32(ggml_round_f16_f32(x*ggml_round_f16_f32(-2.0f*SQRT_2_OVER_PI))*inner);
+    return x/(1.0f + expf(neg_2g));
+}
+
+inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
+    int i = 0;
+    const int gelu_mode = ggml_gelu_mode();
+#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
+    if (gelu_mode == GGML_GELU_MODE_TABLE_F32_GATHER) {
+        const int vl = (int) svcntw();
+        const svbool_t pa = svptrue_b32();
+        for (; i + 4*vl <= n; i += 4*vl) {
+            svst1_f32(pa, y + i + 0*vl, ggml_v_gelu_table_f32(pa, svld1_f32(pa, x + i + 0*vl)));
+            svst1_f32(pa, y + i + 1*vl, ggml_v_gelu_table_f32(pa, svld1_f32(pa, x + i + 1*vl)));
+            svst1_f32(pa, y + i + 2*vl, ggml_v_gelu_table_f32(pa, svld1_f32(pa, x + i + 2*vl)));
+            svst1_f32(pa, y + i + 3*vl, ggml_v_gelu_table_f32(pa, svld1_f32(pa, x + i + 3*vl)));
+        }
+        for (; i < n; i += vl) {
+            const svbool_t pg = svwhilelt_b32_s32(i, n);
+            svst1_f32(pg, y + i, ggml_v_gelu_table_f32(pg, svld1_f32(pg, x + i)));
+        }
+        return;
+    }
+    if (gelu_mode == GGML_GELU_MODE_FP32) {
+        const int vl = (int) svcntw();
+        const svbool_t pa = svptrue_b32();
+        const int sve_unroll = ggml_gelu_sve_unroll();
+        if (sve_unroll == 8) {
+            for (; i + 8*vl <= n; i += 8*vl) {
+                const svfloat32_t x0 = svld1_f32(pa, x + i + 0*vl);
+                const svfloat32_t x1 = svld1_f32(pa, x + i + 1*vl);
+                const svfloat32_t x2 = svld1_f32(pa, x + i + 2*vl);
+                const svfloat32_t x3 = svld1_f32(pa, x + i + 3*vl);
+                const svfloat32_t x4 = svld1_f32(pa, x + i + 4*vl);
+                const svfloat32_t x5 = svld1_f32(pa, x + i + 5*vl);
+                const svfloat32_t x6 = svld1_f32(pa, x + i + 6*vl);
+                const svfloat32_t x7 = svld1_f32(pa, x + i + 7*vl);
+                svfloat32_t y0;
+                svfloat32_t y1;
+                svfloat32_t y2;
+                svfloat32_t y3;
+                svfloat32_t y4;
+                svfloat32_t y5;
+                svfloat32_t y6;
+                svfloat32_t y7;
+                ggml_v_gelu_8(pa, x0, x1, x2, x3, x4, x5, x6, x7, &y0, &y1, &y2, &y3, &y4, &y5, &y6, &y7);
+                svst1_f32(pa, y + i + 0*vl, y0);
+                svst1_f32(pa, y + i + 1*vl, y1);
+                svst1_f32(pa, y + i + 2*vl, y2);
+                svst1_f32(pa, y + i + 3*vl, y3);
+                svst1_f32(pa, y + i + 4*vl, y4);
+                svst1_f32(pa, y + i + 5*vl, y5);
+                svst1_f32(pa, y + i + 6*vl, y6);
+                svst1_f32(pa, y + i + 7*vl, y7);
+            }
+        } else if (sve_unroll == 4) {
+            for (; i + 4*vl <= n; i += 4*vl) {
+                const svfloat32_t x0 = svld1_f32(pa, x + i + 0*vl);
+                const svfloat32_t x1 = svld1_f32(pa, x + i + 1*vl);
+                const svfloat32_t x2 = svld1_f32(pa, x + i + 2*vl);
+                const svfloat32_t x3 = svld1_f32(pa, x + i + 3*vl);
+                svfloat32_t y0;
+                svfloat32_t y1;
+                svfloat32_t y2;
+                svfloat32_t y3;
+                ggml_v_gelu_4(pa, x0, x1, x2, x3, &y0, &y1, &y2, &y3);
+                svst1_f32(pa, y + i + 0*vl, y0);
+                svst1_f32(pa, y + i + 1*vl, y1);
+                svst1_f32(pa, y + i + 2*vl, y2);
+                svst1_f32(pa, y + i + 3*vl, y3);
+            }
+        } else if (sve_unroll == 2) {
+            for (; i + 2*vl <= n; i += 2*vl) {
+                const svfloat32_t x0 = svld1_f32(pa, x + i + 0*vl);
+                const svfloat32_t x1 = svld1_f32(pa, x + i + 1*vl);
+                svfloat32_t y0;
+                svfloat32_t y1;
+                ggml_v_gelu_2(pa, x0, x1, &y0, &y1);
+                svst1_f32(pa, y + i + 0*vl, y0);
+                svst1_f32(pa, y + i + 1*vl, y1);
+            }
+        } else if (sve_unroll == 0) {
+            for (; i + 4*vl <= n; i += 4*vl) {
+                svst1_f32(pa, y + i + 0*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 0*vl)));
+                svst1_f32(pa, y + i + 1*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 1*vl)));
+                svst1_f32(pa, y + i + 2*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 2*vl)));
+                svst1_f32(pa, y + i + 3*vl, ggml_v_gelu(pa, svld1_f32(pa, x + i + 3*vl)));
+            }
+        }
+        for (; i + vl <= n; i += vl) {
+            svst1_f32(pa, y + i, ggml_v_gelu(pa, svld1_f32(pa, x + i)));
+        }
+        for (; i < n; i += vl) {
+            const svbool_t pg = svwhilelt_b32_s32(i, n);
+            svst1_f32(pg, y + i, ggml_v_gelu(pg, svld1_f32(pg, x + i)));
+        }
+        return;
+    }
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    if (gelu_mode == GGML_GELU_MODE_FP16) {
+        const int vl = (int) svcntw();
+        const svbool_t pa = svptrue_b32();
+        for (; i + 4*vl <= n; i += 4*vl) {
+            svst1_f32(pa, y + i + 0*vl, ggml_v_gelu_f16(pa, svld1_f32(pa, x + i + 0*vl)));
+            svst1_f32(pa, y + i + 1*vl, ggml_v_gelu_f16(pa, svld1_f32(pa, x + i + 1*vl)));
+            svst1_f32(pa, y + i + 2*vl, ggml_v_gelu_f16(pa, svld1_f32(pa, x + i + 2*vl)));
+            svst1_f32(pa, y + i + 3*vl, ggml_v_gelu_f16(pa, svld1_f32(pa, x + i + 3*vl)));
+        }
+        for (; i < n; i += vl) {
+            const svbool_t pg = svwhilelt_b32_s32(i, n);
+            svst1_f32(pg, y + i, ggml_v_gelu_f16(pg, svld1_f32(pg, x + i)));
+        }
+        return;
+    }
+#endif
+#endif
+#ifdef GGML_GELU_FP16
+    if (gelu_mode == GGML_GELU_MODE_FP16) {
+        for (; i < n; ++i) {
+            y[i] = ggml_gelu_f32_fp16(x[i]);
+        }
+    } else if (gelu_mode == GGML_GELU_MODE_FP32) {
+        for (; i < n; ++i) {
+            y[i] = ggml_gelu_f32(x[i]);
+        }
+    } else if (gelu_mode == GGML_GELU_MODE_TABLE_F32_PREFETCH) {
+        ggml_vec_gelu_f32_table_f32_prefetch(n, y, x);
+    } else if (gelu_mode == GGML_GELU_MODE_TABLE_F32 ||
+            gelu_mode == GGML_GELU_MODE_TABLE_F32_GATHER) {
+        ggml_vec_gelu_f32_table_f32(n, y, x);
+    } else {
+        ggml_vec_gelu_f32_table_f16(n, y, x);
     }
 #else
     for (; i < n; ++i) {
@@ -1169,6 +1666,82 @@ inline static svfloat32_t ggml_v_expf(svbool_t pg, svfloat32_t x) {
                      svsel_f32(c, svmul_f32_x(pg, svmla_f32_x(pg, s2, s2, j), s1), svmla_f32_x(pg, k, k, j)));
 }
 
+#define GGML_SVE_EXPF_PREP(N) \
+    const svfloat32_t z##N = svmla_n_f32_x(pg, r, x##N, 0x1.715476p+0f); \
+    const svfloat32_t n##N = svsub_f32_x(pg, z##N, r); \
+    const svfloat32_t b##N = svmls_n_f32_x(pg, svmls_n_f32_x(pg, x##N, n##N, 0x1.62e4p-1f), n##N, 0x1.7f7d1cp-20f); \
+    const svfloat32_t u##N = svmul_f32_x(pg, b##N, b##N); \
+    const svfloat32_t j##N = svmla_f32_x(pg, \
+        svmul_n_f32_x(pg, b##N, 0x1.ffffecp-1f), \
+        svmla_f32_x(pg, svmla_f32_x(pg, svdup_n_f32_x(pg, 0x1.fffdb6p-2f), svdup_n_f32_x(pg, 0x1.555e66p-3f), b##N), \
+                        svmla_f32_x(pg, svdup_n_f32_x(pg, 0x1.573e2ep-5f), svdup_n_f32_x(pg, 0x1.0e4020p-7f), b##N), u##N), u##N)
+
+#define GGML_SVE_EXPF_FINISH(N) \
+    do { \
+        const svuint32_t e = svlsl_n_u32_x(pg, svreinterpret_u32_f32(z##N), 23); \
+        const svfloat32_t k = svreinterpret_f32_u32(svadd_u32_x(pg, e, svreinterpret_u32_f32(svdup_n_f32_x(pg, 1)))); \
+        const svbool_t c = svacgt_n_f32(pg, n##N, 126); \
+        const svuint32_t d = svdup_n_u32_z(svcmple_n_f32(pg, n##N, 0.0), 0x82000000); \
+        const svfloat32_t s1 = svreinterpret_f32_u32(svadd_n_u32_x(pg, d, 0x7f000000)); \
+        const svfloat32_t s2 = svreinterpret_f32_u32(svsub_u32_x(pg, e, d)); \
+        *y##N = svsel_f32(svacgt_f32(pg, n##N, svdup_n_f32_x(pg, 192)), svmul_f32_x(pg, s1, s1), \
+                svsel_f32(c, svmul_f32_x(pg, svmla_f32_x(pg, s2, s2, j##N), s1), svmla_f32_x(pg, k, k, j##N))); \
+    } while (0)
+
+inline static void ggml_v_expf_2(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1,
+        svfloat32_t * y0, svfloat32_t * y1) {
+    const svfloat32_t r = svdup_n_f32_x(pg, 0x1.8p23f);
+    GGML_SVE_EXPF_PREP(0);
+    GGML_SVE_EXPF_PREP(1);
+    GGML_SVE_EXPF_FINISH(0);
+    GGML_SVE_EXPF_FINISH(1);
+}
+
+inline static void ggml_v_expf_4(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1, svfloat32_t x2, svfloat32_t x3,
+        svfloat32_t * y0, svfloat32_t * y1, svfloat32_t * y2, svfloat32_t * y3) {
+    const svfloat32_t r = svdup_n_f32_x(pg, 0x1.8p23f);
+    GGML_SVE_EXPF_PREP(0);
+    GGML_SVE_EXPF_PREP(1);
+    GGML_SVE_EXPF_PREP(2);
+    GGML_SVE_EXPF_PREP(3);
+    GGML_SVE_EXPF_FINISH(0);
+    GGML_SVE_EXPF_FINISH(1);
+    GGML_SVE_EXPF_FINISH(2);
+    GGML_SVE_EXPF_FINISH(3);
+}
+
+inline static void ggml_v_expf_8(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1, svfloat32_t x2, svfloat32_t x3,
+        svfloat32_t x4, svfloat32_t x5, svfloat32_t x6, svfloat32_t x7,
+        svfloat32_t * y0, svfloat32_t * y1, svfloat32_t * y2, svfloat32_t * y3,
+        svfloat32_t * y4, svfloat32_t * y5, svfloat32_t * y6, svfloat32_t * y7) {
+    const svfloat32_t r = svdup_n_f32_x(pg, 0x1.8p23f);
+    GGML_SVE_EXPF_PREP(0);
+    GGML_SVE_EXPF_PREP(1);
+    GGML_SVE_EXPF_PREP(2);
+    GGML_SVE_EXPF_PREP(3);
+    GGML_SVE_EXPF_PREP(4);
+    GGML_SVE_EXPF_PREP(5);
+    GGML_SVE_EXPF_PREP(6);
+    GGML_SVE_EXPF_PREP(7);
+    GGML_SVE_EXPF_FINISH(0);
+    GGML_SVE_EXPF_FINISH(1);
+    GGML_SVE_EXPF_FINISH(2);
+    GGML_SVE_EXPF_FINISH(3);
+    GGML_SVE_EXPF_FINISH(4);
+    GGML_SVE_EXPF_FINISH(5);
+    GGML_SVE_EXPF_FINISH(6);
+    GGML_SVE_EXPF_FINISH(7);
+}
+
+#undef GGML_SVE_EXPF_PREP
+#undef GGML_SVE_EXPF_FINISH
+
 // computes silu x/(1+exp(-x)) in single precision vector
 inline static svfloat32_t ggml_v_silu(svbool_t pg, svfloat32_t x) {
     const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
@@ -1190,6 +1763,111 @@ inline static svfloat32_t ggml_v_gelu(svbool_t pg, svfloat32_t x) {
         svmul_f32_x(pg, svmul_n_f32_x(pg, x, -2.0f*SQRT_2_OVER_PI), inner);
     const svfloat32_t e = ggml_v_expf(pg, neg_2g);
     return svdiv_f32_x(pg, x, svadd_f32_x(pg, one, e));
+}
+
+#define GGML_SVE_GELU_PREP(N) \
+    const svfloat32_t x2##N = svmul_f32_x(pg, x##N, x##N); \
+    const svfloat32_t inner##N = svmla_n_f32_x(pg, one, x2##N, GELU_COEF_A); \
+    const svfloat32_t neg_2g##N = svmul_f32_x(pg, svmul_n_f32_x(pg, x##N, -2.0f*SQRT_2_OVER_PI), inner##N)
+
+#define GGML_SVE_GELU_FINISH(N) \
+    *y##N = svdiv_f32_x(pg, x##N, svadd_f32_x(pg, one, e##N))
+
+inline static void ggml_v_gelu_2(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1,
+        svfloat32_t * y0, svfloat32_t * y1) {
+    const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
+    GGML_SVE_GELU_PREP(0);
+    GGML_SVE_GELU_PREP(1);
+    svfloat32_t e0;
+    svfloat32_t e1;
+    ggml_v_expf_2(pg, neg_2g0, neg_2g1, &e0, &e1);
+    GGML_SVE_GELU_FINISH(0);
+    GGML_SVE_GELU_FINISH(1);
+}
+
+inline static void ggml_v_gelu_4(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1, svfloat32_t x2, svfloat32_t x3,
+        svfloat32_t * y0, svfloat32_t * y1, svfloat32_t * y2, svfloat32_t * y3) {
+    const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
+    GGML_SVE_GELU_PREP(0);
+    GGML_SVE_GELU_PREP(1);
+    GGML_SVE_GELU_PREP(2);
+    GGML_SVE_GELU_PREP(3);
+    svfloat32_t e0;
+    svfloat32_t e1;
+    svfloat32_t e2;
+    svfloat32_t e3;
+    ggml_v_expf_4(pg, neg_2g0, neg_2g1, neg_2g2, neg_2g3, &e0, &e1, &e2, &e3);
+    GGML_SVE_GELU_FINISH(0);
+    GGML_SVE_GELU_FINISH(1);
+    GGML_SVE_GELU_FINISH(2);
+    GGML_SVE_GELU_FINISH(3);
+}
+
+inline static void ggml_v_gelu_8(
+        svbool_t pg,
+        svfloat32_t x0, svfloat32_t x1, svfloat32_t x2, svfloat32_t x3,
+        svfloat32_t x4, svfloat32_t x5, svfloat32_t x6, svfloat32_t x7,
+        svfloat32_t * y0, svfloat32_t * y1, svfloat32_t * y2, svfloat32_t * y3,
+        svfloat32_t * y4, svfloat32_t * y5, svfloat32_t * y6, svfloat32_t * y7) {
+    const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
+    GGML_SVE_GELU_PREP(0);
+    GGML_SVE_GELU_PREP(1);
+    GGML_SVE_GELU_PREP(2);
+    GGML_SVE_GELU_PREP(3);
+    GGML_SVE_GELU_PREP(4);
+    GGML_SVE_GELU_PREP(5);
+    GGML_SVE_GELU_PREP(6);
+    GGML_SVE_GELU_PREP(7);
+    svfloat32_t e0;
+    svfloat32_t e1;
+    svfloat32_t e2;
+    svfloat32_t e3;
+    svfloat32_t e4;
+    svfloat32_t e5;
+    svfloat32_t e6;
+    svfloat32_t e7;
+    ggml_v_expf_8(pg,
+            neg_2g0, neg_2g1, neg_2g2, neg_2g3,
+            neg_2g4, neg_2g5, neg_2g6, neg_2g7,
+            &e0, &e1, &e2, &e3, &e4, &e5, &e6, &e7);
+    GGML_SVE_GELU_FINISH(0);
+    GGML_SVE_GELU_FINISH(1);
+    GGML_SVE_GELU_FINISH(2);
+    GGML_SVE_GELU_FINISH(3);
+    GGML_SVE_GELU_FINISH(4);
+    GGML_SVE_GELU_FINISH(5);
+    GGML_SVE_GELU_FINISH(6);
+    GGML_SVE_GELU_FINISH(7);
+}
+
+#undef GGML_SVE_GELU_PREP
+#undef GGML_SVE_GELU_FINISH
+
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+// computes gelu with f16 polynomial intermediates, then widens for exp/div.
+inline static svfloat32_t ggml_v_gelu_f16(svbool_t pg, svfloat32_t x) {
+    const svfloat16_t one = svdup_n_f16(1.0f);
+    const svfloat16_t xh = svcvt_f16_f32_x(pg, x);
+    const svfloat16_t x2 = svmul_f16_x(pg, xh, xh);
+    const svfloat16_t inner = svadd_f16_x(pg, one, svmul_n_f16_x(pg, x2, GELU_COEF_A));
+    const svfloat16_t neg_2g =
+        svmul_f16_x(pg, svmul_n_f16_x(pg, xh, -2.0f*SQRT_2_OVER_PI), inner);
+    const svfloat32_t e = ggml_v_expf(pg, svcvt_f32_f16_x(pg, neg_2g));
+    return svdiv_f32_x(pg, svcvt_f32_f16_x(pg, xh), svadd_f32_x(pg, svdup_n_f32_x(pg, 1.0f), e));
+}
+#endif
+
+inline static svfloat32_t ggml_v_gelu_table_f32(svbool_t pg, svfloat32_t x) {
+    const svfloat16_t xh = svcvt_f16_f32_x(pg, x);
+    const svuint32_t idx = svunpklo_u32(svreinterpret_u16_f16(xh));
+    const svfloat32_t table = svld1_gather_u32index_f32(pg, ggml_table_gelu_f32, idx);
+    const svbool_t lo = svcmple_n_f32(pg, x, -10.0f);
+    const svbool_t hi = svcmpge_n_f32(pg, x, 10.0f);
+    return svsel_f32(hi, x, svsel_f32(lo, svdup_n_f32_x(pg, 0.0f), table));
 }
 
 #elif defined(__ARM_NEON) && defined(__aarch64__)

@@ -5,6 +5,9 @@
 // precomputed gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_f16[1 << 16];
 
+// precomputed gelu table with f32 outputs (256 KB)
+float ggml_table_gelu_f32[1 << 16];
+
 // precomputed quick gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 

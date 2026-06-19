@@ -849,6 +849,12 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    ggml_tensor * build_lora_mm_bias(
+              ggml_tensor * w,
+              ggml_tensor * cur,
+              ggml_tensor * bias,
+              ggml_tensor * w_s = nullptr) const;
+
     // do mat_mul_id, while optionally apply lora
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as

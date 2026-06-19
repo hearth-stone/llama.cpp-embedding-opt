@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <map>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -53,7 +55,7 @@
 
 static constexpr int      GGML_KLEIDIAI_MAX_KERNEL_SLOTS = 2;
 static constexpr uint32_t GGML_KLEIDIAI_PACK_MAGIC       = 0x4b4c4149; // "KLAI"
-static constexpr uint16_t GGML_KLEIDIAI_PACK_VERSION     = 1;
+static constexpr uint16_t GGML_KLEIDIAI_PACK_VERSION     = 2;
 static constexpr size_t   GGML_KLEIDIAI_PACK_ALIGN       = 64;
 
 struct ggml_kleidiai_context {
@@ -367,6 +369,10 @@ struct kleidiai_weight_header {
     uint16_t slot_count;
     uint64_t offsets[GGML_KLEIDIAI_MAX_KERNEL_SLOTS];
     uint64_t sizes[GGML_KLEIDIAI_MAX_KERNEL_SLOTS];
+    uint64_t qdata_offset;
+    uint64_t qdata_size;
+    uint64_t scales_offset;
+    uint64_t scales_size;
 };
 
 static inline kleidiai_weight_header * kleidiai_weight_header_from_ptr(void * data) {
@@ -408,6 +414,130 @@ static inline const uint8_t * kleidiai_weight_slot_ptr(const kleidiai_weight_hea
         return nullptr;
     }
     return reinterpret_cast<const uint8_t *>(header) + header->offsets[slot];
+}
+
+struct kleidiai_bias_cache_key {
+    const void * weight;
+    const void * bias;
+    int slot;
+
+    bool operator<(const kleidiai_bias_cache_key & other) const {
+        if (weight != other.weight) {
+            return weight < other.weight;
+        }
+        if (bias != other.bias) {
+            return bias < other.bias;
+        }
+        return slot < other.slot;
+    }
+};
+
+static std::mutex & kleidiai_bias_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::map<kleidiai_bias_cache_key, std::vector<uint8_t>> & kleidiai_bias_cache() {
+    static std::map<kleidiai_bias_cache_key, std::vector<uint8_t>> cache;
+    return cache;
+}
+
+static inline bool kleidiai_can_use_bias(const ggml_tensor * bias, size_t n) {
+    return bias &&
+           bias->type == GGML_TYPE_F32 &&
+           bias->ne[0] == (int64_t)n &&
+           bias->ne[1] == 1 &&
+           bias->ne[2] == 1 &&
+           bias->ne[3] == 1 &&
+           bias->nb[0] == sizeof(float);
+}
+
+static const uint8_t * kleidiai_get_biased_rhs_packed(
+        const kleidiai_weight_header * header,
+        int slot,
+        ggml_kleidiai_kernels * kernels,
+        size_t n,
+        size_t k,
+        const ggml_tensor * bias) {
+    if (!kleidiai_is_weight_header_valid(header) ||
+        header->qdata_size == 0 ||
+        header->scales_size == 0 ||
+        !kleidiai_can_use_bias(bias, n) ||
+        !kernels ||
+        kernels->rhs_type != GGML_TYPE_Q8_0) {
+        return nullptr;
+    }
+    if (header->qdata_size < n * k * sizeof(int8_t) ||
+        header->scales_size < n * sizeof(float)) {
+        return nullptr;
+    }
+
+    kernel_info * kernel = &kernels->gemm;
+    rhs_packing_info * rhs_info = &kernels->rhs_info;
+    if (!kernel || !rhs_info || !rhs_info->pack_func_ex || !rhs_info->packed_size_ex) {
+        return nullptr;
+    }
+
+    const size_t nr = kernel->get_nr();
+    const size_t kr = kernel->get_kr();
+    const size_t sr = kernel->get_sr();
+    const size_t packed_size = rhs_info->packed_size_ex(n, k, nr, kr, QK8_0);
+
+    kleidiai_bias_cache_key key { header, bias->data, slot };
+
+    std::lock_guard<std::mutex> lock(kleidiai_bias_cache_mutex());
+    auto & cache = kleidiai_bias_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second.data();
+    }
+
+    std::vector<uint8_t> packed(packed_size);
+    const auto * qdata = reinterpret_cast<const int8_t *>(reinterpret_cast<const uint8_t *>(header) + header->qdata_offset);
+    const auto * scales = reinterpret_cast<const float *>(reinterpret_cast<const uint8_t *>(header) + header->scales_offset);
+
+    struct kai_rhs_pack_qsi8cx_params params;
+    params.lhs_zero_point = 1;
+    params.scale_multiplier = 1.0f;
+
+    rhs_info->pack_func_ex(1, n, k, nr, kr, sr, 0, 0,
+                           qdata, bias->data, scales,
+                           packed.data(), 0, &params);
+
+    auto inserted = cache.emplace(key, std::move(packed));
+    return inserted.first->second.data();
+}
+
+static void kleidiai_add_bias_to_dst(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        const ggml_tensor * bias) {
+    if (!bias) {
+        return;
+    }
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(kleidiai_can_use_bias(bias, (size_t)dst->ne[0]));
+
+    const int ith = params->ith;
+    const int nth = params->nth > 0 ? params->nth : 1;
+    const int64_t n = dst->ne[0];
+    const int64_t rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const int64_t dr = (rows + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, rows);
+    const float * bias_data = static_cast<const float *>(bias->data);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir / (dst->ne[2] * dst->ne[1]);
+        const int64_t i2 = (ir - i3 * dst->ne[2] * dst->ne[1]) / dst->ne[1];
+        const int64_t i1 = ir - i3 * dst->ne[2] * dst->ne[1] - i2 * dst->ne[1];
+        float * row = reinterpret_cast<float *>(static_cast<char *>(dst->data) + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+
+        for (int64_t i0 = 0; i0 < n; ++i0) {
+            row[i0] += bias_data[i0];
+        }
+    }
 }
 
 static inline ggml_kleidiai_kernels * kleidiai_primary_kernel_q4() {
@@ -768,12 +898,34 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         const kleidiai_weight_header * header = kleidiai_weight_header_from_ptr(src0->data);
         const bool has_header = kleidiai_is_weight_header_valid(header);
         const bool is_gemv = src1->ne[1] == 1;
+        const ggml_tensor * bias = dst->src[2];
+        if (bias) {
+            GGML_ASSERT(kleidiai_can_use_bias(bias, (size_t)src0->ne[1]));
+        }
+
         std::array<ggml_kleidiai_kernels *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> kernel_chain;
         const int slot_total = kleidiai_collect_kernel_chain(dst, kernel_chain);
+
+        std::array<const uint8_t *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> biased_rhs{};
+        bool bias_fused = bias != nullptr && src0->type == GGML_TYPE_Q8_0 && has_header && slot_total > 0;
+        if (bias_fused) {
+            for (int slot = 0; slot < slot_total && slot < GGML_KLEIDIAI_MAX_KERNEL_SLOTS; ++slot) {
+                biased_rhs[slot] = kleidiai_get_biased_rhs_packed(
+                    header, slot, kernel_chain[slot], (size_t)src0->ne[1], (size_t)src0->ne[0], bias);
+                if (!biased_rhs[slot]) {
+                    bias_fused = false;
+                    break;
+                }
+            }
+        }
 
         auto weight_for_slot = [&](int slot_index, size_t & size_out) -> const uint8_t * {
             if (slot_index < 0 || slot_index >= slot_total) {
                 return nullptr;
+            }
+            if (bias_fused && biased_rhs[slot_index]) {
+                size_out = 1;
+                return biased_rhs[slot_index];
             }
             if (has_header) {
                 if (slot_index < header->slot_count) {
@@ -1117,6 +1269,11 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             }
         }
 
+        if (bias && !bias_fused) {
+            ggml_barrier(params->threadpool);
+            kleidiai_add_bias_to_dst(params, dst, bias);
+        }
+
         return true;
     }
 
@@ -1226,6 +1383,10 @@ public:
         header->magic      = GGML_KLEIDIAI_PACK_MAGIC;
         header->version    = GGML_KLEIDIAI_PACK_VERSION;
         header->slot_count = 0;
+        header->qdata_offset = 0;
+        header->qdata_size = 0;
+        header->scales_offset = 0;
+        header->scales_size = 0;
 
         uint8_t * base_ptr = static_cast<uint8_t *>(tensor->data);
         size_t cursor = sizeof(kleidiai_weight_header);
@@ -1341,6 +1502,17 @@ public:
             header->magic   = 0;
             header->version = 0;
             memcpy(tensor->data, data, data_size);
+        } else if (want_q8 && !qdata.empty() && !scales.empty()) {
+            cursor = align_up(cursor, GGML_KLEIDIAI_PACK_ALIGN);
+            header->qdata_offset = cursor;
+            header->qdata_size = qdata.size() * sizeof(qdata[0]);
+            memcpy(base_ptr + cursor, qdata.data(), header->qdata_size);
+            cursor += header->qdata_size;
+
+            cursor = align_up(cursor, GGML_KLEIDIAI_PACK_ALIGN);
+            header->scales_offset = cursor;
+            header->scales_size = scales.size() * sizeof(scales[0]);
+            memcpy(base_ptr + cursor, scales.data(), header->scales_size);
         }
 
         return 0;
@@ -1447,6 +1619,13 @@ static size_t ggml_backend_cpu_kleidiai_buffer_type_get_alloc_size(ggml_backend_
         return ggml_nbytes(tensor);
     }
 
+    if (want_q8) {
+        cursor = align_up(cursor, GGML_KLEIDIAI_PACK_ALIGN);
+        cursor += n * k * sizeof(int8_t);
+        cursor = align_up(cursor, GGML_KLEIDIAI_PACK_ALIGN);
+        cursor += n * sizeof(float);
+    }
+
     return std::max(cursor, ggml_nbytes(tensor));
 }
 
@@ -1469,6 +1648,14 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             }
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
+            }
+            if (op->src[2]) {
+                if (!kleidiai_can_use_bias(op->src[2], (size_t)op->src[0]->ne[1])) {
+                    return false;
+                }
+                if (op->src[2]->buffer && !ggml_backend_buft_is_host(op->src[2]->buffer->buft)) {
+                    return false;
+                }
             }
             if ((op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_I32) &&
                 ggml_ne(op->src[1], 3) == 1) {

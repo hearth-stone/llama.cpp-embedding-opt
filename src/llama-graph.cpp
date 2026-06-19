@@ -1123,6 +1123,62 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+static bool llm_graph_can_fuse_q8_bias(
+        const ggml_tensor * w,
+        const ggml_tensor * bias,
+        const ggml_tensor * w_s) {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_KLEIDIAI_FUSED_BIAS");
+        return env == nullptr || std::strcmp(env, "0") != 0;
+    }();
+    return w &&
+           bias &&
+           enabled &&
+           w_s == nullptr &&
+           w->type == GGML_TYPE_Q8_0 &&
+           bias->type == GGML_TYPE_F32 &&
+           bias->ne[0] == w->ne[1] &&
+           bias->ne[1] == 1 &&
+           bias->ne[2] == 1 &&
+           bias->ne[3] == 1;
+}
+
+ggml_tensor * llm_graph_context::build_lora_mm_bias(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * bias,
+          ggml_tensor * w_s) const {
+    if (!bias) {
+        return build_lora_mm(w, cur, w_s);
+    }
+
+    if (!llm_graph_can_fuse_q8_bias(w, bias, w_s)) {
+        return ggml_add(ctx0, build_lora_mm(w, cur, w_s), bias);
+    }
+
+    ggml_tensor * res = ggml_mul_mat_bias(ctx0, w, cur, bias);
+
+    for (const auto & lora : *loras) {
+        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+        if (lw == nullptr) {
+            continue;
+        }
+
+        const float adapter_scale = lora.second;
+        const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+
+        ggml_tensor * ab_cur = ggml_mul_mat(
+                ctx0, lw->b,
+                ggml_mul_mat(ctx0, lw->a, cur)
+                );
+
+        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        res = ggml_add(ctx0, res, ab_cur);
+    }
+
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -1201,12 +1257,28 @@ llm_graph_qkv llm_graph_context::build_qkv(
 
     if (layer.wqkv) {
         // fused QKV path
+        if (layer.wqkv_b) {
+            ggml_tensor * qkv = build_lora_mm_bias(layer.wqkv, cur, layer.wqkv_b, layer.wqkv_s);
+            cb(qkv, "wqkv_b", il);
+            if (hparams.f_clamp_kqv > 0.0f) {
+                qkv = ggml_clamp(ctx0, qkv, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+                cb(qkv, "wqkv_clamped", il);
+            }
+            Qcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head,    n_tokens,
+                ggml_row_size(qkv->type, n_embd_head), qkv->nb[1], 0);
+            Kcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens,
+                ggml_row_size(qkv->type, n_embd_head), qkv->nb[1],
+                ggml_row_size(qkv->type, n_embd_q));
+            Vcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens,
+                ggml_row_size(qkv->type, n_embd_head), qkv->nb[1],
+                ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
+            cb(Qcur, "Qcur", il);
+            cb(Kcur, "Kcur", il);
+            cb(Vcur, "Vcur", il);
+            return { Qcur, Kcur, Vcur };
+        }
         ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s);
         cb(qkv, "wqkv", il);
-        if (layer.wqkv_b) {
-            qkv = ggml_add(ctx0, qkv, layer.wqkv_b);
-            cb(qkv, "wqkv_b", il);
-        }
         if (hparams.f_clamp_kqv > 0.0f) {
             qkv = ggml_clamp(ctx0, qkv, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(qkv, "wqkv_clamped", il);
@@ -1221,32 +1293,20 @@ llm_graph_qkv llm_graph_context::build_qkv(
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
     } else {
         // separate Q/K/V path
-        Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+        Qcur = layer.wq_b ? build_lora_mm_bias(layer.wq, cur, layer.wq_b, layer.wq_s) : build_lora_mm(layer.wq, cur, layer.wq_s);
         cb(Qcur, "Qcur", il);
-        if (layer.wq_b) {
-            Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
-            cb(Qcur, "Qcur", il);
-        }
         if (hparams.f_clamp_kqv > 0.0f) {
             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Qcur, "Qcur_clamped", il);
         }
-        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = layer.wk_b ? build_lora_mm_bias(layer.wk, cur, layer.wk_b, layer.wk_s) : build_lora_mm(layer.wk, cur, layer.wk_s);
         cb(Kcur, "Kcur", il);
-        if (layer.wk_b) {
-            Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
-            cb(Kcur, "Kcur", il);
-        }
         if (hparams.f_clamp_kqv > 0.0f) {
             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Kcur, "Kcur_clamped", il);
         }
-        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = layer.wv_b ? build_lora_mm_bias(layer.wv, cur, layer.wv_b, layer.wv_s) : build_lora_mm(layer.wv, cur, layer.wv_s);
         cb(Vcur, "Vcur", il);
-        if (layer.wv_b) {
-            Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
-            cb(Vcur, "Vcur", il);
-        }
         if (hparams.f_clamp_kqv > 0.0f) {
             Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Vcur, "Vcur_clamped", il);
@@ -1279,12 +1339,13 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
-    cb(tmp, "ffn_up", il);
-
-    if (up_b) {
-        tmp = ggml_add(ctx0, tmp, up_b);
+    ggml_tensor * tmp = nullptr;
+    if (up && up_b) {
+        tmp = build_lora_mm_bias(up, cur, up_b);
         cb(tmp, "ffn_up_b", il);
+    } else {
+        tmp = up ? build_lora_mm(up, cur) : cur;
+        cb(tmp, "ffn_up", il);
     }
 
     if (up_s) {
@@ -1405,19 +1466,24 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down) {
-        cur = build_lora_mm(down, cur);
+        const bool fuse_down_b = down_b &&
+            llm_graph_can_fuse_q8_bias(down, down_b, nullptr) &&
+            arch != LLM_ARCH_GLM4 &&
+            arch != LLM_ARCH_GLM4_MOE &&
+            arch != LLM_ARCH_JAIS2;
+        cur = fuse_down_b ? build_lora_mm_bias(down, cur, down_b) : build_lora_mm(down, cur);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
+        if (down_b && !fuse_down_b) {
+            cb(cur, "ffn_down", il);
+            cur = ggml_add(ctx0, cur, down_b);
+        }
     }
 
-    if (down_b) {
-        cb(cur, "ffn_down", il);
-    }
-
-    if (down_b) {
-        cur = ggml_add(ctx0, cur, down_b);
+    if (down_b && llm_graph_can_fuse_q8_bias(down, down_b, nullptr)) {
+        cb(cur, "ffn_down_b", il);
     }
 
     if (down_s) {
@@ -2326,15 +2392,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
-    }
-
-    if (wo_b) {
-        //cb(cur, "kqv_wo", il);
-    }
-
-    if (wo_b) {
-        cur = ggml_add(ctx0, cur, wo_b);
+        cur = wo_b ? build_lora_mm_bias(wo, cur, wo_b, wo_s) : build_lora_mm(wo, cur, wo_s);
     }
 
     return cur;

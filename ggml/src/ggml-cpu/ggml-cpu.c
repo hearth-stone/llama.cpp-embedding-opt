@@ -1248,6 +1248,7 @@ void ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * src2 = dst->src[2];
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
@@ -1290,7 +1291,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    if (!src2 && src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1355,7 +1356,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    if (!src2 && src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1439,6 +1440,34 @@ UseGgmlGemm2:;
         }
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+    }
+
+    if (src2) {
+        GGML_ASSERT(src2->type == GGML_TYPE_F32);
+        GGML_ASSERT(src2->ne[0] == ne0);
+        GGML_ASSERT(src2->ne[1] == 1);
+        GGML_ASSERT(src2->ne[2] == 1);
+        GGML_ASSERT(src2->ne[3] == 1);
+        GGML_ASSERT(src2->nb[0] == sizeof(float));
+
+        ggml_barrier(params->threadpool);
+
+        const int64_t nr = ne1 * ne2 * ne3;
+        const int64_t dr = (nr + nth - 1) / nth;
+        const int64_t ir0 = dr * ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+        const float * bias = (const float *) src2->data;
+
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t i3 = ir / (ne2 * ne1);
+            const int64_t i2 = (ir - i3 * ne2 * ne1) / ne1;
+            const int64_t i1 = ir - i3 * ne2 * ne1 - i2 * ne1;
+            float * row = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3);
+
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                row[i0] += bias[i0];
+            }
+        }
     }
 }
 

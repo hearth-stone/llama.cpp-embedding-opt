@@ -3258,6 +3258,25 @@ struct ggml_tensor * ggml_mul_mat(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_bias(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * bias) {
+    struct ggml_tensor * result = ggml_mul_mat(ctx, a, b);
+
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->ne[0] == result->ne[0]);
+    GGML_ASSERT(bias->ne[1] == 1);
+    GGML_ASSERT(bias->ne[2] == 1);
+    GGML_ASSERT(bias->ne[3] == 1);
+    GGML_ASSERT(ggml_can_repeat(bias, result));
+
+    result->src[2] = bias;
+
+    return result;
+}
+
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

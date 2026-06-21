@@ -503,6 +503,7 @@ extern "C" {
         GGML_OP_CONCAT,
         GGML_OP_SILU_BACK,
         GGML_OP_NORM, // normalize
+        GGML_OP_NORM_AFFINE,
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
@@ -1362,6 +1363,13 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_norm_affine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * bias,
             float                 eps);
 
     GGML_API struct ggml_tensor * ggml_norm_inplace(

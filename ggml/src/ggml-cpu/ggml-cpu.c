@@ -1837,6 +1837,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_norm(params, tensor);
             } break;
+        case GGML_OP_NORM_AFFINE:
+            {
+                ggml_compute_forward_norm_affine(params, tensor);
+            } break;
         case GGML_OP_RMS_NORM:
             {
                 ggml_compute_forward_rms_norm(params, tensor);
@@ -2327,6 +2331,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
+        case GGML_OP_NORM_AFFINE:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:

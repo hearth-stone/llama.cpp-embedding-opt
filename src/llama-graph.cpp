@@ -41,6 +41,25 @@ static ggml_tensor * build_attn_inp_kq_mask(
     return res;
 }
 
+static bool llm_graph_fused_norm_affine_enabled() {
+    const char * env = std::getenv("GGML_FUSED_NORM_AFFINE");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
+static bool llm_graph_can_fuse_norm_affine(
+        const ggml_tensor * cur,
+        const ggml_tensor * mw,
+        const ggml_tensor * mb) {
+    return cur && mw && mb &&
+        cur->type == GGML_TYPE_F32 &&
+        mw->type  == GGML_TYPE_F32 &&
+        mb->type  == GGML_TYPE_F32 &&
+        mw->ne[0] == cur->ne[0] &&
+        mb->ne[0] == cur->ne[0] &&
+        mw->ne[1] == 1 && mw->ne[2] == 1 && mw->ne[3] == 1 &&
+        mb->ne[1] == 1 && mb->ne[2] == 1 && mb->ne[3] == 1;
+}
+
 static bool can_reuse_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_context * mctx,
@@ -1213,6 +1232,12 @@ ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * mb,
        llm_norm_type   type,
                  int   il) const {
+    if (type == LLM_NORM && llm_graph_fused_norm_affine_enabled() && llm_graph_can_fuse_norm_affine(cur, mw, mb)) {
+        cur = ggml_norm_affine(ctx0, cur, mw, mb, hparams.f_norm_eps);
+        cb(cur, "norm_affine", il);
+        return cur;
+    }
+
     switch (type) {
         case LLM_NORM:       cur = ggml_norm    (ctx0, cur, hparams.f_norm_eps);     break;
         case LLM_NORM_RMS:   cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps); break;

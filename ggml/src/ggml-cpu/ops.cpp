@@ -3762,6 +3762,149 @@ void ggml_compute_forward_norm(
     }
 }
 
+// ggml_compute_forward_norm_affine
+
+static ggml_float ggml_vec_variance_f32_no_store(const int n, const float * x, const float mean) {
+    int i = 0;
+    ggml_float sum = 0.0;
+
+#if defined(__ARM_FEATURE_SVE)
+    for (; i < n; i += svcntw()) {
+        const svbool_t pg = svwhilelt_b32(i, n);
+        const svfloat32_t vx = svld1_f32(pg, x + i);
+        const svfloat32_t vdiff = svsub_n_f32_x(pg, vx, mean);
+        const svfloat32_t vsq = svmul_f32_x(pg, vdiff, vdiff);
+        sum += (ggml_float) svaddv_f32(pg, vsq);
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        const float32x4_t vx = vld1q_f32(x + i);
+        const float32x4_t vdiff = vsubq_f32(vx, vdupq_n_f32(mean));
+        const float32x4_t vsq = vmulq_f32(vdiff, vdiff);
+        sum += (ggml_float) vaddvq_f32(vsq);
+    }
+#endif
+
+    for (; i < n; ++i) {
+        const float diff = x[i] - mean;
+        sum += (ggml_float) diff * diff;
+    }
+
+    return sum / n;
+}
+
+static void ggml_vec_norm_affine_f32(
+        const int     n,
+        float       * y,
+        const float * x,
+        const float * w,
+        const float * b,
+        const float   mean,
+        const float   scale) {
+    int i = 0;
+
+#if defined(__ARM_FEATURE_SVE)
+    for (; i < n; i += svcntw()) {
+        const svbool_t pg = svwhilelt_b32(i, n);
+        const svfloat32_t vx = svld1_f32(pg, x + i);
+        const svfloat32_t vw = svld1_f32(pg, w + i);
+        const svfloat32_t vb = svld1_f32(pg, b + i);
+        const svfloat32_t vn = svmul_n_f32_x(pg, svsub_n_f32_x(pg, vx, mean), scale);
+        const svfloat32_t vy = svadd_f32_x(pg, svmul_f32_x(pg, vn, vw), vb);
+        svst1_f32(pg, y + i, vy);
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t vmean  = vdupq_n_f32(mean);
+    const float32x4_t vscale = vdupq_n_f32(scale);
+    for (; i + 3 < n; i += 4) {
+        const float32x4_t vx = vld1q_f32(x + i);
+        const float32x4_t vw = vld1q_f32(w + i);
+        const float32x4_t vb = vld1q_f32(b + i);
+        const float32x4_t vn = vmulq_f32(vsubq_f32(vx, vmean), vscale);
+        const float32x4_t vy = vaddq_f32(vmulq_f32(vn, vw), vb);
+        vst1q_f32(y + i, vy);
+    }
+#endif
+
+    for (; i < n; ++i) {
+        y[i] = ((x[i] - mean) * scale) * w[i] + b[i];
+    }
+}
+
+static void ggml_compute_forward_norm_affine_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0]  == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    GGML_ASSERT(src1->ne[0] == ne00);
+    GGML_ASSERT(src2->ne[0] == ne00);
+    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(src2->ne[1] == 1 && src2->ne[2] == 1 && src2->ne[3] == 1);
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    GGML_ASSERT(eps >= 0.0f);
+
+    const float * w = (const float *) src1->data;
+    const float * b = (const float *) src2->data;
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const float * x = (const float *) ((const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                float       * y = (float *)       ((char *)       dst->data  + i01*nb1  + i02*nb2  + i03*nb3);
+
+                float sum = 0.0f;
+                ggml_vec_sum_f32(ne00, &sum, x);
+                const float mean = sum / ne00;
+
+                const float variance = ggml_vec_variance_f32_no_store(ne00, x, mean);
+                const float scale = 1.0f / sqrtf(variance + eps);
+
+                ggml_vec_norm_affine_f32(ne00, y, x, w, b, mean, scale);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_norm_affine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_norm_affine_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_group_rms_norm
 
 // fusion kinds that can be combined with the rms_norm computation in a single pass.

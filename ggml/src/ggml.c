@@ -999,6 +999,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONCAT",
     "SILU_BACK",
     "NORM",
+    "NORM_AFFINE",
     "RMS_NORM",
     "RMS_NORM_BACK",
     "GROUP_NORM",
@@ -1082,7 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1111,6 +1112,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "concat(x, y)",
     "silu_back(x)",
     "norm(x)",
+    "norm(x)*w+b",
     "rms_norm(x)",
     "rms_norm_back(x)",
     "group_norm(x)",
@@ -1194,7 +1196,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3107,6 +3109,27 @@ struct ggml_tensor * ggml_norm(
         struct ggml_tensor  * a,
         float                 eps) {
     return ggml_norm_impl(ctx, a, eps, false);
+}
+
+struct ggml_tensor * ggml_norm_affine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * bias,
+        float                 eps) {
+    GGML_ASSERT(ggml_can_repeat(weight, a));
+    GGML_ASSERT(ggml_can_repeat(bias,   a));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_NORM_AFFINE;
+    result->src[0] = a;
+    result->src[1] = weight;
+    result->src[2] = bias;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_norm_inplace(

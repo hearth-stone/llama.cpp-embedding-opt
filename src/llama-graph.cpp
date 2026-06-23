@@ -43,7 +43,17 @@ static ggml_tensor * build_attn_inp_kq_mask(
 
 static bool llm_graph_fused_norm_affine_enabled() {
     const char * env = std::getenv("GGML_FUSED_NORM_AFFINE");
-    return env != nullptr && strcmp(env, "0") != 0;
+    if (env == nullptr || env[0] == '\0') {
+        return true;
+    }
+
+    return strcmp(env, "0")     != 0 &&
+           strcmp(env, "off")   != 0 &&
+           strcmp(env, "OFF")   != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "FALSE") != 0 &&
+           strcmp(env, "no")    != 0 &&
+           strcmp(env, "NO")    != 0;
 }
 
 static bool llm_graph_can_fuse_norm_affine(

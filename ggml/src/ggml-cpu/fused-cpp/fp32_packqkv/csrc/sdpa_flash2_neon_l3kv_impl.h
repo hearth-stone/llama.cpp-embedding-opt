@@ -117,10 +117,17 @@ inline bool use_sve_qkt_4x32_experiment_impl() {
 inline bool use_qkt_rowmax_fusion_impl() {
   static const bool enabled = [] {
     const char* env = std::getenv("FUSED_CPP_SDPA_QKT_ROWMAX");
-    return env != nullptr &&
-           std::strcmp(env, "0") != 0 &&
+    if (env == nullptr || env[0] == '\0') {
+      return true;
+    }
+
+    return std::strcmp(env, "0") != 0 &&
+           std::strcmp(env, "off") != 0 &&
+           std::strcmp(env, "OFF") != 0 &&
            std::strcmp(env, "false") != 0 &&
-           std::strcmp(env, "FALSE") != 0;
+           std::strcmp(env, "FALSE") != 0 &&
+           std::strcmp(env, "no") != 0 &&
+           std::strcmp(env, "NO") != 0;
   }();
   return enabled;
 }

@@ -417,8 +417,9 @@ static inline const uint8_t * kleidiai_weight_slot_ptr(const kleidiai_weight_hea
 }
 
 struct kleidiai_bias_cache_key {
-    const void * weight;
-    const void * bias;
+    const ggml_tensor * weight;
+    const ggml_tensor * bias;
+    const void * bias_data;
     int slot;
 
     bool operator<(const kleidiai_bias_cache_key & other) const {
@@ -428,18 +429,46 @@ struct kleidiai_bias_cache_key {
         if (bias != other.bias) {
             return bias < other.bias;
         }
+        if (bias_data != other.bias_data) {
+            return bias_data < other.bias_data;
+        }
         return slot < other.slot;
     }
 };
 
-static std::mutex & kleidiai_bias_cache_mutex() {
-    static std::mutex mutex;
-    return mutex;
+struct kleidiai_buffer_context {
+    explicit kleidiai_buffer_context(void * base) : base(base) {}
+
+    void * base;
+    std::mutex bias_cache_mutex;
+    std::map<kleidiai_bias_cache_key, std::vector<uint8_t>> bias_cache;
+};
+
+static inline ggml_backend_buffer_t kleidiai_tensor_buffer(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return nullptr;
+    }
+    if (tensor->buffer) {
+        return tensor->buffer;
+    }
+    return tensor->view_src ? tensor->view_src->buffer : nullptr;
 }
 
-static std::map<kleidiai_bias_cache_key, std::vector<uint8_t>> & kleidiai_bias_cache() {
-    static std::map<kleidiai_bias_cache_key, std::vector<uint8_t>> cache;
-    return cache;
+static inline kleidiai_buffer_context * kleidiai_buffer_ctx(ggml_backend_buffer_t buffer) {
+    if (!buffer || buffer->buft != ggml_backend_cpu_kleidiai_buffer_type()) {
+        return nullptr;
+    }
+    return static_cast<kleidiai_buffer_context *>(buffer->context);
+}
+
+static void kleidiai_buffer_clear_bias_cache(ggml_backend_buffer_t buffer) {
+    kleidiai_buffer_context * ctx = kleidiai_buffer_ctx(buffer);
+    if (!ctx) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->bias_cache_mutex);
+    ctx->bias_cache.clear();
 }
 
 static inline bool kleidiai_can_use_bias(const ggml_tensor * bias, size_t n) {
@@ -453,12 +482,13 @@ static inline bool kleidiai_can_use_bias(const ggml_tensor * bias, size_t n) {
 }
 
 static const uint8_t * kleidiai_get_biased_rhs_packed(
-        const kleidiai_weight_header * header,
+        const ggml_tensor * weight,
         int slot,
         ggml_kleidiai_kernels * kernels,
         size_t n,
         size_t k,
         const ggml_tensor * bias) {
+    const kleidiai_weight_header * header = weight ? kleidiai_weight_header_from_ptr(weight->data) : nullptr;
     if (!kleidiai_is_weight_header_valid(header) ||
         header->qdata_size == 0 ||
         header->scales_size == 0 ||
@@ -483,10 +513,15 @@ static const uint8_t * kleidiai_get_biased_rhs_packed(
     const size_t sr = kernel->get_sr();
     const size_t packed_size = rhs_info->packed_size_ex(n, k, nr, kr, QK8_0);
 
-    kleidiai_bias_cache_key key { header, bias->data, slot };
+    kleidiai_buffer_context * ctx = kleidiai_buffer_ctx(kleidiai_tensor_buffer(weight));
+    if (!ctx) {
+        return nullptr;
+    }
 
-    std::lock_guard<std::mutex> lock(kleidiai_bias_cache_mutex());
-    auto & cache = kleidiai_bias_cache();
+    kleidiai_bias_cache_key key { weight, bias, bias->data, slot };
+
+    std::lock_guard<std::mutex> lock(ctx->bias_cache_mutex);
+    auto & cache = ctx->bias_cache;
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second.data();
@@ -911,7 +946,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         if (bias_fused) {
             for (int slot = 0; slot < slot_total && slot < GGML_KLEIDIAI_MAX_KERNEL_SLOTS; ++slot) {
                 biased_rhs[slot] = kleidiai_get_biased_rhs_packed(
-                    header, slot, kernel_chain[slot], (size_t)src0->ne[1], (size_t)src0->ne[0], bias);
+                    src0, slot, kernel_chain[slot], (size_t)src0->ne[1], (size_t)src0->ne[0], bias);
                 if (!biased_rhs[slot]) {
                     bias_fused = false;
                     break;
@@ -1525,6 +1560,26 @@ static ggml::cpu::tensor_traits * get_tensor_traits(ggml_backend_buffer_t, struc
 }
 }  // namespace ggml::cpu::kleidiai
 
+static void * ggml_backend_cpu_kleidiai_buffer_get_base(ggml_backend_buffer_t buffer) {
+    kleidiai_buffer_context * ctx = kleidiai_buffer_ctx(buffer);
+    GGML_ASSERT(ctx);
+
+    uintptr_t data = (uintptr_t)ctx->base;
+    if (data % TENSOR_ALIGNMENT != 0) {
+        data = GGML_PAD(data, TENSOR_ALIGNMENT);
+    }
+
+    return (void *)data;
+}
+
+static void ggml_backend_cpu_kleidiai_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    kleidiai_buffer_context * ctx = kleidiai_buffer_ctx(buffer);
+    GGML_ASSERT(ctx);
+
+    ggml_aligned_free(ctx->base, buffer->size);
+    delete ctx;
+}
+
 static enum ggml_status ggml_backend_cpu_kleidiai_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     tensor->extra = (void *) ggml::cpu::kleidiai::get_tensor_traits(buffer, tensor);
 
@@ -1532,16 +1587,38 @@ static enum ggml_status ggml_backend_cpu_kleidiai_buffer_init_tensor(ggml_backen
     GGML_UNUSED(buffer);
 }
 
+static void ggml_backend_cpu_kleidiai_buffer_memset_tensor(
+        ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    GGML_ASSERT(tensor);
+    memset((char *)tensor->data + offset, value, size);
+
+    kleidiai_buffer_clear_bias_cache(buffer);
+}
+
 static void ggml_backend_cpu_kleidiai_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                        const void * data, size_t offset, size_t size) {
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
+
+    kleidiai_buffer_clear_bias_cache(buffer);
 
     auto tensor_traits = (ggml::cpu::kleidiai::tensor_traits *) tensor->extra;
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
     GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_kleidiai_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    kleidiai_buffer_context * ctx = kleidiai_buffer_ctx(buffer);
+    GGML_ASSERT(ctx);
+
+    memset(ctx->base, value, buffer->size);
+    kleidiai_buffer_clear_bias_cache(buffer);
+}
+
+static void ggml_backend_cpu_kleidiai_buffer_reset(ggml_backend_buffer_t buffer) {
+    kleidiai_buffer_clear_bias_cache(buffer);
 }
 
 static const char * ggml_backend_cpu_kleidiai_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -1556,11 +1633,19 @@ static ggml_backend_buffer_t ggml_backend_cpu_kleidiai_buffer_type_alloc_buffer(
         return nullptr;
     }
 
-    buffer->buft              = buft;
-    buffer->iface.init_tensor = ggml_backend_cpu_kleidiai_buffer_init_tensor;
-    buffer->iface.set_tensor  = ggml_backend_cpu_kleidiai_buffer_set_tensor;
-    buffer->iface.get_tensor  = nullptr;
-    buffer->iface.cpy_tensor  = nullptr;
+    kleidiai_buffer_context * ctx = new kleidiai_buffer_context(buffer->context);
+
+    buffer->buft                = buft;
+    buffer->context             = ctx;
+    buffer->iface.free_buffer   = ggml_backend_cpu_kleidiai_buffer_free_buffer;
+    buffer->iface.get_base      = ggml_backend_cpu_kleidiai_buffer_get_base;
+    buffer->iface.init_tensor   = ggml_backend_cpu_kleidiai_buffer_init_tensor;
+    buffer->iface.memset_tensor = ggml_backend_cpu_kleidiai_buffer_memset_tensor;
+    buffer->iface.set_tensor    = ggml_backend_cpu_kleidiai_buffer_set_tensor;
+    buffer->iface.get_tensor    = nullptr;
+    buffer->iface.cpy_tensor    = nullptr;
+    buffer->iface.clear         = ggml_backend_cpu_kleidiai_buffer_clear;
+    buffer->iface.reset         = ggml_backend_cpu_kleidiai_buffer_reset;
     return buffer;
 }
 

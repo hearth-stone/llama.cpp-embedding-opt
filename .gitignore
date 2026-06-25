@@ -29,6 +29,7 @@
 /.direnv/
 /.envrc
 /.idea/
+/rsync.sh
 /.swiftpm
 /.vs/
 /.vscode/

@@ -1152,17 +1152,42 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+static ggml_backend_buffer_t llm_graph_get_tensor_buffer(const ggml_tensor * t) {
+    if (!t) {
+        return nullptr;
+    }
+
+    if (t->buffer) {
+        return t->buffer;
+    }
+
+    return t->view_src ? t->view_src->buffer : nullptr;
+}
+
+static bool llm_graph_tensor_on_backend_device(const ggml_tensor * t, ggml_backend_t backend) {
+    ggml_backend_buffer_t buffer = llm_graph_get_tensor_buffer(t);
+    if (!buffer || !backend) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+    return ggml_backend_buft_get_device(buft) == ggml_backend_get_device(backend);
+}
+
 static bool llm_graph_can_fuse_q8_bias(
         const ggml_tensor * w,
         const ggml_tensor * bias,
-        const ggml_tensor * w_s) {
+        const ggml_tensor * w_s,
+        ggml_backend_t backend_cpu) {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_KLEIDIAI_FUSED_BIAS");
         return env == nullptr || std::strcmp(env, "0") != 0;
     }();
+
     return w &&
            bias &&
            enabled &&
+           llm_graph_tensor_on_backend_device(w, backend_cpu) &&
            w_s == nullptr &&
            w->type == GGML_TYPE_Q8_0 &&
            bias->type == GGML_TYPE_F32 &&
@@ -1181,11 +1206,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_bias(
         return build_lora_mm(w, cur, w_s);
     }
 
-    if (!llm_graph_can_fuse_q8_bias(w, bias, w_s)) {
+    if (!llm_graph_can_fuse_q8_bias(w, bias, w_s, backend_cpu)) {
         return ggml_add(ctx0, build_lora_mm(w, cur, w_s), bias);
     }
 
     ggml_tensor * res = ggml_mul_mat_bias(ctx0, w, cur, bias);
+    ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -1502,7 +1528,7 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     if (down) {
         const bool fuse_down_b = down_b &&
-            llm_graph_can_fuse_q8_bias(down, down_b, nullptr) &&
+            llm_graph_can_fuse_q8_bias(down, down_b, nullptr, backend_cpu) &&
             arch != LLM_ARCH_GLM4 &&
             arch != LLM_ARCH_GLM4_MOE &&
             arch != LLM_ARCH_JAIS2;
@@ -1517,7 +1543,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         }
     }
 
-    if (down_b && llm_graph_can_fuse_q8_bias(down, down_b, nullptr)) {
+    if (down_b && llm_graph_can_fuse_q8_bias(down, down_b, nullptr, backend_cpu)) {
         cb(cur, "ffn_down_b", il);
     }
 
